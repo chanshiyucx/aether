@@ -7,6 +7,7 @@ const DEFAULT_CONFIG_PATH: &str = "aether.toml";
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    pub path: PathBuf,
     pub originals_dir: PathBuf,
     pub thumbnails_dir: PathBuf,
     pub thumbnail_width: u32,
@@ -45,12 +46,24 @@ impl Config {
         Ok(())
     }
 
+    pub fn root_dir(&self) -> PathBuf {
+        self.path.clone()
+    }
+
+    pub fn originals_path(&self) -> PathBuf {
+        resolve_under_root(&self.root_dir(), &self.originals_dir)
+    }
+
+    pub fn thumbnails_path(&self) -> PathBuf {
+        resolve_under_root(&self.root_dir(), &self.thumbnails_dir)
+    }
+
     pub fn manifest_path(&self) -> PathBuf {
-        PathBuf::from("manifest.json")
+        self.root_dir().join("manifest.json")
     }
 
     pub fn state_path(&self) -> PathBuf {
-        PathBuf::from("state.json")
+        self.root_dir().join("state.json")
     }
 }
 
@@ -61,5 +74,13 @@ impl ThumbnailFormat {
             Self::Png => "png",
             Self::Webp => "webp",
         }
+    }
+}
+
+fn resolve_under_root(root: &std::path::Path, path: &PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path.clone()
+    } else {
+        root.join(path)
     }
 }

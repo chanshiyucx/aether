@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::BufWriter,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -19,7 +20,7 @@ use walkdir::WalkDir;
 
 use crate::config::{Config, ThumbnailFormat};
 
-const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heif", "heic", "hif"];
 
 pub enum BuildExit {
     Success,
@@ -28,34 +29,53 @@ pub enum BuildExit {
 
 pub fn run() -> Result<BuildExit> {
     let config = Config::load()?;
+    let originals_dir = config.originals_path();
+    let thumbnails_dir = config.thumbnails_path();
+    let root_dir = config.root_dir();
+    let started_at = Instant::now();
 
-    if !config.originals_dir.exists() {
+    if !originals_dir.exists() {
         bail!(
             "originals directory does not exist: {}",
-            config.originals_dir.display()
+            originals_dir.display()
         );
     }
 
-    fs::create_dir_all(&config.thumbnails_dir).with_context(|| {
+    fs::create_dir_all(&thumbnails_dir).with_context(|| {
         format!(
             "failed to create thumbnails directory {}",
-            config.thumbnails_dir.display()
+            thumbnails_dir.display()
         )
     })?;
 
     let mut photos = Vec::new();
     let mut files = BTreeMap::new();
     let mut failures = Vec::new();
+    let originals = collect_originals(&originals_dir)?;
+    let total = originals.len();
 
-    for path in collect_originals(&config.originals_dir)? {
-        match process_one(&config, &path) {
+    println!("starting build");
+    println!("root: {}", root_dir.display());
+    println!("originals: {}", originals_dir.display());
+    println!("thumbnails: {}", thumbnails_dir.display());
+    println!("found {} supported images", total);
+
+    for (index, path) in originals.iter().enumerate() {
+        let current = index + 1;
+        let display_path =
+            normalize_relative_path(&root_dir, path).unwrap_or_else(|_| path.display().to_string());
+        println!("[{current}/{total}] processing {display_path}");
+
+        match process_one(&config, &root_dir, &originals_dir, &thumbnails_dir, &path) {
             Ok(processed) => {
                 files.insert(processed.state_key, processed.state_entry);
                 photos.push(processed.photo_entry);
+                println!("[{current}/{total}] done {display_path}");
             }
             Err(error) => {
                 warn!("skipped {}: {error:#}", path.display());
-                failures.push(path);
+                println!("[{current}/{total}] failed {display_path}: {error:#}");
+                failures.push(path.clone());
             }
         }
     }
@@ -89,8 +109,10 @@ pub fn run() -> Result<BuildExit> {
     );
 
     println!(
-        "build completed: {} processed, {} failed",
-        processed_count, failed_count
+        "build completed: {} processed, {} failed, elapsed {:.2?}",
+        processed_count,
+        failed_count,
+        started_at.elapsed()
     );
 
     if failures.is_empty() {
@@ -119,15 +141,19 @@ fn collect_originals(originals_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn process_one(config: &Config, original_path: &Path) -> Result<ProcessedPhoto> {
-    let relative = original_path
-        .strip_prefix(&config.originals_dir)
-        .with_context(|| {
-            format!(
-                "failed to strip originals prefix from {}",
-                original_path.display()
-            )
-        })?;
+fn process_one(
+    config: &Config,
+    root_dir: &Path,
+    originals_dir: &Path,
+    thumbnails_dir: &Path,
+    original_path: &Path,
+) -> Result<ProcessedPhoto> {
+    let relative = original_path.strip_prefix(originals_dir).with_context(|| {
+        format!(
+            "failed to strip originals prefix from {}",
+            original_path.display()
+        )
+    })?;
 
     let image = ImageReader::open(original_path)
         .with_context(|| format!("failed to open {}", original_path.display()))?
@@ -144,7 +170,7 @@ fn process_one(config: &Config, original_path: &Path) -> Result<ProcessedPhoto> 
     let original_metadata = fs::metadata(original_path)
         .with_context(|| format!("failed to read metadata for {}", original_path.display()))?;
 
-    let thumbnail_path = build_thumbnail_path(config, relative);
+    let thumbnail_path = build_thumbnail_path(thumbnails_dir, config, relative);
     if let Some(parent) = thumbnail_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -170,8 +196,8 @@ fn process_one(config: &Config, original_path: &Path) -> Result<ProcessedPhoto> 
         None
     };
 
-    let original_key = normalize_path(original_path);
-    let thumbnail_key = normalize_path(&thumbnail_path);
+    let original_key = normalize_relative_path(root_dir, original_path)?;
+    let thumbnail_key = normalize_relative_path(root_dir, &thumbnail_path)?;
     let title = original_path
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
@@ -249,7 +275,7 @@ fn save_thumbnail(
 }
 
 fn compute_blurhash(image: &DynamicImage) -> Result<String> {
-    let reduced = image.thumbnail(32, 32).to_rgb8();
+    let reduced = image.thumbnail(32, 32).to_rgba8();
     let width = reduced.width();
     let height = reduced.height();
     let pixels = reduced.into_raw();
@@ -258,8 +284,12 @@ fn compute_blurhash(image: &DynamicImage) -> Result<String> {
         .map_err(|error| anyhow!("failed to encode blurhash: {error}"))
 }
 
-fn build_thumbnail_path(config: &Config, relative_original: &Path) -> PathBuf {
-    let mut path = config.thumbnails_dir.join(relative_original);
+fn build_thumbnail_path(
+    thumbnails_dir: &Path,
+    config: &Config,
+    relative_original: &Path,
+) -> PathBuf {
+    let mut path = thumbnails_dir.join(relative_original);
     path.set_extension(config.thumbnail_format.extension());
     path
 }
@@ -285,11 +315,16 @@ fn now_rfc3339() -> Result<String> {
     Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
 }
 
-fn normalize_path(path: &Path) -> String {
-    path.components()
+fn normalize_relative_path(root_dir: &Path, path: &Path) -> Result<String> {
+    let relative = path
+        .strip_prefix(root_dir)
+        .with_context(|| format!("failed to strip root prefix from {}", path.display()))?;
+
+    Ok(relative
+        .components()
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
-        .join("/")
+        .join("/"))
 }
 
 fn is_supported(path: &Path) -> bool {
@@ -310,6 +345,7 @@ fn mime_from_extension(path: &Path) -> String {
             "jpg" | "jpeg" => "image/jpeg",
             "png" => "image/png",
             "webp" => "image/webp",
+            "heif" | "heic" | "hif" => "image/heif",
             _ => "application/octet-stream",
         })
         .unwrap_or("application/octet-stream")
