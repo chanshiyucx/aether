@@ -1,0 +1,6 @@
+originals_dir = "./originals"
+thumbnails_dir = "./.thumbnails"
+thumbnail_width = 640
+thumbnail_format = "webp"
+thumbnail_quality = 82
+enable_blurhash = true
