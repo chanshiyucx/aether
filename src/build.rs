@@ -1,27 +1,30 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     fs::File,
-    io::BufWriter,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use blurhash::encode;
+use fast_image_resize as fr;
 use image::{
-    ColorType, DynamicImage, GenericImageView, ImageFormat, ImageReader, codecs::jpeg::JpegEncoder,
-    imageops::FilterType,
+    ColorType, DynamicImage, GenericImageView, ImageBuffer, ImageFormat, ImageReader, Rgb, Rgba,
+    codecs::jpeg::JpegEncoder,
 };
-use serde::Serialize;
+use indicatif::{ProgressBar, ProgressStyle};
+use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
+use rayon::{ThreadPoolBuilder, prelude::*};
+use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tracing::{info, warn};
+use tracing::warn;
 use walkdir::WalkDir;
 
 use crate::config::{Config, ThumbnailFormat};
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heif", "heic", "hif"];
-
 pub enum BuildExit {
     Success,
     PartialFailure,
@@ -48,41 +51,95 @@ pub fn run() -> Result<BuildExit> {
         )
     })?;
 
-    let mut photos = Vec::new();
-    let mut files = BTreeMap::new();
-    let mut failures = Vec::new();
-    let originals = collect_originals(&originals_dir)?;
+    let previous_manifest = load_previous_manifest(&config.manifest_path())?;
+    let previous_state = load_previous_state(&config.state_path())?;
+    let mut originals = collect_originals(&originals_dir, &root_dir)?;
+    originals.sort_by(|left, right| left.original_key.cmp(&right.original_key));
+
     let total = originals.len();
+    let parallelism = recommended_parallelism();
 
     println!("starting build");
     println!("root: {}", root_dir.display());
     println!("originals: {}", originals_dir.display());
     println!("thumbnails: {}", thumbnails_dir.display());
     println!("found {} supported images", total);
+    println!("workers: {}", parallelism);
 
-    for (index, path) in originals.iter().enumerate() {
-        let current = index + 1;
-        let display_path =
-            normalize_relative_path(&root_dir, path).unwrap_or_else(|_| path.display().to_string());
-        println!("[{current}/{total}] processing {display_path}");
+    let progress = ProgressBar::new(total as u64);
+    progress.set_style(progress_style()?);
+    progress.set_message("building");
 
-        match process_one(&config, &root_dir, &originals_dir, &thumbnails_dir, &path) {
+    let current_keys: BTreeSet<_> = originals
+        .iter()
+        .map(|item| item.original_key.clone())
+        .collect();
+    cleanup_removed_outputs(&root_dir, &current_keys, &previous_state)?;
+
+    let mut photos = Vec::new();
+    let mut files = BTreeMap::new();
+    let mut pending = Vec::new();
+    let mut reused_count = 0usize;
+
+    for item in originals {
+        if let Some((photo, state_entry)) =
+            try_reuse(&root_dir, &item, &previous_manifest, &previous_state)
+        {
+            progress.inc(1);
+            photos.push(photo);
+            files.insert(item.original_key, state_entry);
+            reused_count += 1;
+        } else {
+            pending.push(item);
+        }
+    }
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(parallelism)
+        .build()
+        .map_err(|error| anyhow!("failed to build thread pool: {error}"))?;
+
+    let results: Vec<_> = pool.install(|| {
+        pending
+            .par_iter()
+            .map(|item| {
+                let result = process_one(
+                    &config,
+                    &root_dir,
+                    &originals_dir,
+                    &thumbnails_dir,
+                    &item.path,
+                    item.size,
+                    item.mtime_ms,
+                );
+                progress.inc(1);
+
+                if let Err(error) = &result {
+                    warn!("skipped {}: {error:#}", item.path.display());
+                    progress.println(format!("failed {}: {error:#}", item.original_key));
+                }
+
+                result
+            })
+            .collect()
+    });
+
+    let mut failures = Vec::new();
+    let mut built_count = 0usize;
+
+    for result in results {
+        match result {
             Ok(processed) => {
                 files.insert(processed.state_key, processed.state_entry);
                 photos.push(processed.photo_entry);
-                println!("[{current}/{total}] done {display_path}");
+                built_count += 1;
             }
-            Err(error) => {
-                warn!("skipped {}: {error:#}", path.display());
-                println!("[{current}/{total}] failed {display_path}: {error:#}");
-                failures.push(path.clone());
-            }
+            Err(error) => failures.push(error.to_string()),
         }
     }
 
     photos.sort_by(|left, right| left.original.url.cmp(&right.original.url));
 
-    let processed_count = photos.len();
     let failed_count = failures.len();
     let now = now_rfc3339()?;
     write_json(
@@ -102,15 +159,12 @@ pub fn run() -> Result<BuildExit> {
         },
     )?;
 
-    info!(
-        processed = processed_count,
-        failed = failed_count,
-        "build completed"
-    );
+    progress.finish_and_clear();
 
     println!(
-        "build completed: {} processed, {} failed, elapsed {:.2?}",
-        processed_count,
+        "build completed: {} built, {} reused, {} failed, elapsed {:.2?}",
+        built_count,
+        reused_count,
         failed_count,
         started_at.elapsed()
     );
@@ -122,7 +176,7 @@ pub fn run() -> Result<BuildExit> {
     }
 }
 
-fn collect_originals(originals_dir: &Path) -> Result<Vec<PathBuf>> {
+fn collect_originals(originals_dir: &Path, root_dir: &Path) -> Result<Vec<OriginalItem>> {
     let mut files = Vec::new();
 
     for entry in WalkDir::new(originals_dir) {
@@ -134,11 +188,63 @@ fn collect_originals(originals_dir: &Path) -> Result<Vec<PathBuf>> {
         }
 
         if is_supported(path) {
-            files.push(path.to_path_buf());
+            let metadata = fs::metadata(path)
+                .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+            files.push(OriginalItem {
+                path: path.to_path_buf(),
+                original_key: normalize_relative_path(root_dir, path)?,
+                size: metadata.len(),
+                mtime_ms: metadata_mtime_ms(&metadata)?,
+            });
         }
     }
 
     Ok(files)
+}
+
+fn try_reuse(
+    root_dir: &Path,
+    item: &OriginalItem,
+    previous_manifest: &LoadedManifest,
+    previous_state: &StateFile,
+) -> Option<(PhotoEntry, StateEntry)> {
+    let state_entry = previous_state.files.get(&item.original_key)?;
+    let photo_entry = previous_manifest.photos_by_key.get(&item.original_key)?;
+
+    if state_entry.size != item.size || state_entry.mtime_ms != item.mtime_ms {
+        return None;
+    }
+
+    let thumbnail_path = root_dir.join(&state_entry.thumbnail);
+    if !thumbnail_path.exists() {
+        return None;
+    }
+
+    Some((photo_entry.clone(), state_entry.clone()))
+}
+
+fn cleanup_removed_outputs(
+    root_dir: &Path,
+    current_keys: &BTreeSet<String>,
+    previous_state: &StateFile,
+) -> Result<()> {
+    for (original_key, state_entry) in &previous_state.files {
+        if current_keys.contains(original_key) {
+            continue;
+        }
+
+        let thumbnail_path = root_dir.join(&state_entry.thumbnail);
+        if thumbnail_path.exists() {
+            fs::remove_file(&thumbnail_path).with_context(|| {
+                format!(
+                    "failed to remove stale thumbnail {}",
+                    thumbnail_path.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn process_one(
@@ -147,6 +253,8 @@ fn process_one(
     originals_dir: &Path,
     thumbnails_dir: &Path,
     original_path: &Path,
+    original_size: u64,
+    original_mtime_ms: u128,
 ) -> Result<ProcessedPhoto> {
     let relative = original_path.strip_prefix(originals_dir).with_context(|| {
         format!(
@@ -155,20 +263,8 @@ fn process_one(
         )
     })?;
 
-    let image = ImageReader::open(original_path)
-        .with_context(|| format!("failed to open {}", original_path.display()))?
-        .with_guessed_format()
-        .with_context(|| {
-            format!(
-                "failed to guess image format for {}",
-                original_path.display()
-            )
-        })?
-        .decode()
+    let image = load_image(original_path)
         .with_context(|| format!("failed to decode {}", original_path.display()))?;
-
-    let original_metadata = fs::metadata(original_path)
-        .with_context(|| format!("failed to read metadata for {}", original_path.display()))?;
 
     let thumbnail_path = build_thumbnail_path(thumbnails_dir, config, relative);
     if let Some(parent) = thumbnail_path.parent() {
@@ -176,7 +272,7 @@ fn process_one(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let thumbnail_image = resize_image(&image, config.thumbnail_width);
+    let thumbnail_image = resize_image(&image, config.thumbnail_width)?;
     save_thumbnail(
         &thumbnail_image,
         &thumbnail_path,
@@ -191,7 +287,7 @@ fn process_one(
     let (thumbnail_width, thumbnail_height) = thumbnail_image.dimensions();
 
     let blurhash = if config.enable_blurhash {
-        Some(compute_blurhash(&image)?)
+        Some(compute_blurhash(&thumbnail_image)?)
     } else {
         None
     };
@@ -206,8 +302,8 @@ fn process_one(
     Ok(ProcessedPhoto {
         state_key: original_key.clone(),
         state_entry: StateEntry {
-            size: original_metadata.len(),
-            mtime_ms: metadata_mtime_ms(&original_metadata)?,
+            size: original_size,
+            mtime_ms: original_mtime_ms,
             thumbnail: thumbnail_key.clone(),
             processed_at: now_rfc3339()?,
         },
@@ -216,7 +312,7 @@ fn process_one(
                 url: original_key,
                 width: Some(original_width),
                 height: Some(original_height),
-                bytes: original_metadata.len(),
+                bytes: original_size,
                 mime: mime_from_extension(original_path),
             },
             thumbnail: Asset {
@@ -236,16 +332,84 @@ fn process_one(
     })
 }
 
-fn resize_image(image: &DynamicImage, target_width: u32) -> DynamicImage {
+fn resize_image(image: &DynamicImage, target_width: u32) -> Result<DynamicImage> {
     let width = image.width();
     if width <= target_width {
-        return image.clone();
+        return Ok(image.clone());
     }
 
     let ratio = target_width as f64 / width as f64;
     let target_height = (image.height() as f64 * ratio).round() as u32;
+    let target_height = target_height.max(1);
+    let src = image.to_rgba8();
+    let src_width = src.width();
+    let src_height = src.height();
+    let src_image =
+        fr::images::Image::from_vec_u8(src_width, src_height, src.into_raw(), fr::PixelType::U8x4)
+            .map_err(|error| anyhow!("failed to create resize source buffer: {error}"))?;
+    let mut dst_image = fr::images::Image::new(target_width, target_height, fr::PixelType::U8x4);
+    let options =
+        fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3));
+    let mut resizer = fr::Resizer::new();
+    resizer
+        .resize(&src_image, &mut dst_image, Some(&options))
+        .map_err(|error| anyhow!("failed to resize image: {error}"))?;
 
-    image.resize_exact(target_width, target_height.max(1), FilterType::Lanczos3)
+    let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
+        target_width,
+        target_height,
+        dst_image.into_vec(),
+    )
+    .ok_or_else(|| anyhow!("failed to build resized RGBA image buffer"))?;
+
+    Ok(DynamicImage::ImageRgba8(buffer))
+}
+
+fn load_image(path: &Path) -> Result<DynamicImage> {
+    if is_heif_family(path) {
+        return decode_heif_image(path);
+    }
+
+    ImageReader::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("failed to guess image format for {}", path.display()))?
+        .decode()
+        .with_context(|| format!("failed to decode {}", path.display()))
+}
+
+fn decode_heif_image(path: &Path) -> Result<DynamicImage> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?;
+    let context = HeifContext::read_from_file(path_str)
+        .with_context(|| format!("failed to open HEIF container {}", path.display()))?;
+    let handle = context
+        .primary_image_handle()
+        .with_context(|| format!("failed to read primary image handle {}", path.display()))?;
+    let image = LibHeif::new()
+        .decode(&handle, ColorSpace::Rgb(RgbChroma::Rgb), None)
+        .with_context(|| format!("failed to decode HEIF image {}", path.display()))?;
+    let planes = image.planes();
+    let plane = planes
+        .interleaved
+        .ok_or_else(|| anyhow!("HEIF image is not interleaved: {}", path.display()))?;
+
+    let row_size = plane.width as usize * 3;
+    let mut pixels = Vec::with_capacity(row_size * plane.height as usize);
+
+    for row in plane
+        .data
+        .chunks_exact(plane.stride)
+        .take(plane.height as usize)
+    {
+        pixels.extend_from_slice(&row[..row_size]);
+    }
+
+    let rgb = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(plane.width, plane.height, pixels)
+        .ok_or_else(|| anyhow!("failed to construct RGB image buffer {}", path.display()))?;
+
+    Ok(DynamicImage::ImageRgb8(rgb))
 }
 
 fn save_thumbnail(
@@ -267,7 +431,12 @@ fn save_thumbnail(
             image.write_to(&mut writer, ImageFormat::Png)?;
         }
         ThumbnailFormat::Webp => {
-            image.write_to(&mut writer, ImageFormat::WebP)?;
+            let rgba = image.to_rgba8();
+            let encoder = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height());
+            let encoded = encoder.encode((quality as f32).clamp(1.0, 100.0));
+            writer
+                .write_all(encoded.as_ref())
+                .with_context(|| format!("failed to write {}", path.display()))?;
         }
     }
 
@@ -294,12 +463,79 @@ fn build_thumbnail_path(
     path
 }
 
+fn load_previous_manifest(path: &Path) -> Result<LoadedManifest> {
+    if !path.exists() {
+        return Ok(LoadedManifest {
+            photos_by_key: BTreeMap::new(),
+        });
+    }
+
+    let file = File::open(path)
+        .with_context(|| format!("failed to open previous manifest {}", path.display()))?;
+    let manifest: ManifestFile = serde_json::from_reader(file)
+        .with_context(|| format!("failed to parse previous manifest {}", path.display()))?;
+    let photos_by_key = manifest
+        .photos
+        .into_iter()
+        .map(|photo| (photo.original.url.clone(), photo))
+        .collect();
+
+    Ok(LoadedManifest { photos_by_key })
+}
+
+fn recommended_parallelism() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let physical = num_cpus::get_physical();
+    let baseline = match physical {
+        0 => available,
+        n => available.min(n),
+    };
+
+    ((baseline * 3) / 4).max(1)
+}
+
+fn progress_style() -> Result<ProgressStyle> {
+    ProgressStyle::with_template(
+        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
+    )
+    .map(|style| style.progress_chars("=>-"))
+    .map_err(|error| anyhow!("failed to configure progress bar: {error}"))
+}
+
+fn load_previous_state(path: &Path) -> Result<StateFile> {
+    if !path.exists() {
+        return Ok(StateFile {
+            version: 1,
+            updated_at: String::new(),
+            files: BTreeMap::new(),
+        });
+    }
+
+    let file = File::open(path)
+        .with_context(|| format!("failed to open previous state {}", path.display()))?;
+    let state: StateFile = serde_json::from_reader(file)
+        .with_context(|| format!("failed to parse previous state {}", path.display()))?;
+    Ok(state)
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let file =
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, value)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    let tmp_path = path.with_extension("tmp");
+    {
+        let file = File::create(&tmp_path)
+            .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(writer, value)
+            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    }
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -337,6 +573,18 @@ fn is_supported(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_heif_family(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "hif" | "heif" | "heic"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn mime_from_extension(path: &Path) -> String {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -360,13 +608,24 @@ fn mime_from_format(format: ThumbnailFormat) -> &'static str {
     }
 }
 
+struct OriginalItem {
+    path: PathBuf,
+    original_key: String,
+    size: u64,
+    mtime_ms: u128,
+}
+
 struct ProcessedPhoto {
     state_key: String,
     state_entry: StateEntry,
     photo_entry: PhotoEntry,
 }
 
-#[derive(Serialize)]
+struct LoadedManifest {
+    photos_by_key: BTreeMap<String, PhotoEntry>,
+}
+
+#[derive(Deserialize, Serialize)]
 struct ManifestFile {
     version: u8,
     #[serde(rename = "updatedAt")]
@@ -374,7 +633,7 @@ struct ManifestFile {
     photos: Vec<PhotoEntry>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct PhotoEntry {
     original: Asset,
     thumbnail: Asset,
@@ -391,7 +650,7 @@ struct PhotoEntry {
     image: Option<ImageMetadata>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Asset {
     url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -402,7 +661,7 @@ struct Asset {
     mime: String,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct StateFile {
     version: u8,
     #[serde(rename = "updatedAt")]
@@ -410,7 +669,7 @@ struct StateFile {
     files: BTreeMap<String, StateEntry>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct StateEntry {
     size: u64,
     #[serde(rename = "mtimeMs")]
@@ -420,7 +679,7 @@ struct StateEntry {
     processed_at: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Location {
     lat: f64,
     lng: f64,
@@ -429,7 +688,7 @@ struct Location {
     city: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Camera {
     make: String,
     model: String,
@@ -443,7 +702,7 @@ struct Camera {
     iso: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct ImageMetadata {
     orientation: u8,
     #[serde(rename = "colorSpace")]
