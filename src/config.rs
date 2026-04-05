@@ -7,7 +7,12 @@ const DEFAULT_CONFIG_PATH: &str = "aether.toml";
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub path: PathBuf,
+    #[serde(rename = "targetPath")]
+    pub target_path: PathBuf,
+    #[serde(rename = "sourcePath")]
+    pub source_path: PathBuf,
+    #[serde(default, rename = "sourceTags")]
+    pub source_tags: Vec<String>,
     pub originals_dir: PathBuf,
     pub thumbnails_dir: PathBuf,
     pub thumbnail_width: u32,
@@ -35,6 +40,10 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.source_tags.iter().any(|tag| tag.trim().is_empty()) {
+            bail!("sourceTags must not contain empty values");
+        }
+
         if self.thumbnail_width == 0 {
             bail!("thumbnail_width must be greater than 0");
         }
@@ -47,7 +56,15 @@ impl Config {
     }
 
     pub fn root_dir(&self) -> PathBuf {
-        self.path.clone()
+        resolve_from_cwd(&self.target_path)
+    }
+
+    pub fn source_path(&self) -> PathBuf {
+        resolve_from_cwd(&self.source_path)
+    }
+
+    pub fn source_tags(&self) -> &[String] {
+        &self.source_tags
     }
 
     pub fn originals_path(&self) -> PathBuf {
@@ -82,5 +99,15 @@ fn resolve_under_root(root: &std::path::Path, path: &PathBuf) -> PathBuf {
         path.clone()
     } else {
         root.join(path)
+    }
+}
+
+fn resolve_from_cwd(path: &PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path.clone()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     }
 }

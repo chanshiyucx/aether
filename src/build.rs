@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     fs::File,
-    io::{BufWriter, Write},
+    io::{BufWriter, Cursor, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -11,11 +11,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use blurhash::encode;
 use fast_image_resize as fr;
 use image::{
-    ColorType, DynamicImage, GenericImageView, ImageBuffer, ImageFormat, ImageReader, Rgb, Rgba,
-    codecs::jpeg::JpegEncoder,
+    ColorType, DynamicImage, ExtendedColorType, GenericImageView, ImageBuffer, ImageEncoder,
+    ImageFormat, ImageReader, Rgb, Rgba, codecs::avif::AvifEncoder, codecs::jpeg::JpegEncoder,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
+use plist::Value as PlistValue;
 use rayon::{ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -25,6 +26,12 @@ use walkdir::WalkDir;
 use crate::config::{Config, ThumbnailFormat};
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heif", "heic", "hif"];
+const FINDER_TAGS_XATTR: &str = "com.apple.metadata:_kMDItemUserTags";
+const AVIF_EXTENSION: &str = "avif";
+const AVIF_MIME: &str = "image/avif";
+const AVIF_QUALITY: u8 = 82;
+const AVIF_SPEED: u8 = 8;
+
 pub enum BuildExit {
     Success,
     PartialFailure,
@@ -32,18 +39,27 @@ pub enum BuildExit {
 
 pub fn run() -> Result<BuildExit> {
     let config = Config::load()?;
+
+    if !config.source_tags().is_empty() && !cfg!(target_os = "macos") {
+        bail!("sourceTags filtering currently only supports macOS");
+    }
+
+    let source_dir = config.source_path();
     let originals_dir = config.originals_path();
     let thumbnails_dir = config.thumbnails_path();
     let root_dir = config.root_dir();
     let started_at = Instant::now();
 
-    if !originals_dir.exists() {
-        bail!(
-            "originals directory does not exist: {}",
-            originals_dir.display()
-        );
+    if !source_dir.exists() {
+        bail!("source directory does not exist: {}", source_dir.display());
     }
 
+    fs::create_dir_all(&originals_dir).with_context(|| {
+        format!(
+            "failed to create originals directory {}",
+            originals_dir.display()
+        )
+    })?;
     fs::create_dir_all(&thumbnails_dir).with_context(|| {
         format!(
             "failed to create thumbnails directory {}",
@@ -53,27 +69,33 @@ pub fn run() -> Result<BuildExit> {
 
     let previous_manifest = load_previous_manifest(&config.manifest_path())?;
     let previous_state = load_previous_state(&config.state_path())?;
-    let mut originals = collect_originals(&originals_dir, &root_dir)?;
-    originals.sort_by(|left, right| left.original_key.cmp(&right.original_key));
+    let mut sources = collect_selected_sources(&source_dir, config.source_tags())?;
+    sources.sort_by(|left, right| left.source_key.cmp(&right.source_key));
 
-    let total = originals.len();
+    let total = sources.len();
     let parallelism = recommended_parallelism();
+    let avif_threads = recommended_avif_threads(parallelism, total);
 
     println!("starting build");
     println!("root: {}", root_dir.display());
+    println!("source: {}", source_dir.display());
+    if !config.source_tags().is_empty() {
+        println!("tags: {}", config.source_tags().join(", "));
+    }
     println!("originals: {}", originals_dir.display());
     println!("thumbnails: {}", thumbnails_dir.display());
-    println!("found {} supported images", total);
+    if !config.source_tags().is_empty() {
+        println!("found {} tagged images", total);
+    } else {
+        println!("found {} supported images", total);
+    }
     println!("workers: {}", parallelism);
 
     let progress = ProgressBar::new(total as u64);
     progress.set_style(progress_style()?);
     progress.set_message("building");
 
-    let current_keys: BTreeSet<_> = originals
-        .iter()
-        .map(|item| item.original_key.clone())
-        .collect();
+    let current_keys: BTreeSet<_> = sources.iter().map(|item| item.source_key.clone()).collect();
     cleanup_removed_outputs(&root_dir, &current_keys, &previous_state)?;
 
     let mut photos = Vec::new();
@@ -81,13 +103,13 @@ pub fn run() -> Result<BuildExit> {
     let mut pending = Vec::new();
     let mut reused_count = 0usize;
 
-    for item in originals {
+    for item in sources {
         if let Some((photo, state_entry)) =
             try_reuse(&root_dir, &item, &previous_manifest, &previous_state)
         {
             progress.inc(1);
             photos.push(photo);
-            files.insert(item.original_key, state_entry);
+            files.insert(item.source_key, state_entry);
             reused_count += 1;
         } else {
             pending.push(item);
@@ -108,15 +130,14 @@ pub fn run() -> Result<BuildExit> {
                     &root_dir,
                     &originals_dir,
                     &thumbnails_dir,
-                    &item.path,
-                    item.size,
-                    item.mtime_ms,
+                    avif_threads,
+                    item,
                 );
                 progress.inc(1);
 
                 if let Err(error) = &result {
                     warn!("skipped {}: {error:#}", item.path.display());
-                    progress.println(format!("failed {}: {error:#}", item.original_key));
+                    progress.println(format!("failed {}: {error:#}", item.source_key));
                 }
 
                 result
@@ -176,10 +197,10 @@ pub fn run() -> Result<BuildExit> {
     }
 }
 
-fn collect_originals(originals_dir: &Path, root_dir: &Path) -> Result<Vec<OriginalItem>> {
-    let mut files = Vec::new();
+fn collect_selected_sources(source_dir: &Path, source_tags: &[String]) -> Result<Vec<SourceItem>> {
+    let mut candidates = Vec::new();
 
-    for entry in WalkDir::new(originals_dir) {
+    for entry in WalkDir::new(source_dir) {
         let entry = entry?;
         let path = entry.path();
 
@@ -188,30 +209,106 @@ fn collect_originals(originals_dir: &Path, root_dir: &Path) -> Result<Vec<Origin
         }
 
         if is_supported(path) {
-            let metadata = fs::metadata(path)
-                .with_context(|| format!("failed to read metadata for {}", path.display()))?;
-            files.push(OriginalItem {
-                path: path.to_path_buf(),
-                original_key: normalize_relative_path(root_dir, path)?,
-                size: metadata.len(),
-                mtime_ms: metadata_mtime_ms(&metadata)?,
-            });
+            candidates.push(path.to_path_buf());
         }
     }
 
-    Ok(files)
+    let results: Vec<_> = candidates
+        .par_iter()
+        .map(|path| build_source_item(source_dir, path, source_tags))
+        .collect();
+
+    let mut selected = Vec::new();
+    for result in results {
+        if let Some(item) = result? {
+            selected.push(item);
+        }
+    }
+
+    Ok(selected)
+}
+
+fn build_source_item(
+    source_dir: &Path,
+    path: &Path,
+    source_tags: &[String],
+) -> Result<Option<SourceItem>> {
+    if !source_tags.is_empty() && !has_any_finder_tag(path, source_tags)? {
+        return Ok(None);
+    }
+
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let relative_path = path
+        .strip_prefix(source_dir)
+        .with_context(|| format!("failed to strip source prefix from {}", path.display()))?
+        .to_path_buf();
+
+    Ok(Some(SourceItem {
+        path: path.to_path_buf(),
+        relative_path,
+        source_key: normalize_relative_path(source_dir, path)?,
+        size: metadata.len(),
+        mtime_ms: metadata_mtime_ms(&metadata)?,
+    }))
+}
+
+fn has_any_finder_tag(path: &Path, expected_tags: &[String]) -> Result<bool> {
+    let tags = read_finder_tags(path)?;
+    Ok(expected_tags
+        .iter()
+        .any(|expected| tags.iter().any(|tag| tag == expected)))
+}
+
+fn read_finder_tags(path: &Path) -> Result<Vec<String>> {
+    let Some(raw) = xattr::get(path, FINDER_TAGS_XATTR)
+        .with_context(|| format!("failed to read Finder tags for {}", path.display()))?
+    else {
+        return Ok(Vec::new());
+    };
+
+    let value = PlistValue::from_reader(Cursor::new(raw))
+        .with_context(|| format!("failed to parse Finder tags for {}", path.display()))?;
+
+    let tags = match value {
+        PlistValue::Array(values) => values
+            .into_iter()
+            .filter_map(|value| match value {
+                PlistValue::String(tag) => Some(normalize_finder_tag(tag)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    Ok(tags)
+}
+
+fn normalize_finder_tag(tag: String) -> String {
+    tag.split_once('\n')
+        .map(|(name, _)| name.to_string())
+        .unwrap_or(tag)
 }
 
 fn try_reuse(
     root_dir: &Path,
-    item: &OriginalItem,
+    item: &SourceItem,
     previous_manifest: &LoadedManifest,
     previous_state: &StateFile,
 ) -> Option<(PhotoEntry, StateEntry)> {
-    let state_entry = previous_state.files.get(&item.original_key)?;
-    let photo_entry = previous_manifest.photos_by_key.get(&item.original_key)?;
+    let state_entry = previous_state.files.get(&item.source_key)?;
+    if state_entry.original.is_empty() {
+        return None;
+    }
+
+    let photo_entry = previous_manifest.photos_by_key.get(&state_entry.original)?;
 
     if state_entry.size != item.size || state_entry.mtime_ms != item.mtime_ms {
+        return None;
+    }
+
+    let original_path = root_dir.join(&state_entry.original);
+    if !original_path.exists() {
         return None;
     }
 
@@ -228,20 +325,27 @@ fn cleanup_removed_outputs(
     current_keys: &BTreeSet<String>,
     previous_state: &StateFile,
 ) -> Result<()> {
-    for (original_key, state_entry) in &previous_state.files {
-        if current_keys.contains(original_key) {
+    for (source_key, state_entry) in &previous_state.files {
+        if current_keys.contains(source_key) {
             continue;
         }
 
-        let thumbnail_path = root_dir.join(&state_entry.thumbnail);
-        if thumbnail_path.exists() {
-            fs::remove_file(&thumbnail_path).with_context(|| {
-                format!(
-                    "failed to remove stale thumbnail {}",
-                    thumbnail_path.display()
-                )
-            })?;
-        }
+        remove_output_if_exists(root_dir, &state_entry.original)?;
+        remove_output_if_exists(root_dir, &state_entry.thumbnail)?;
+    }
+
+    Ok(())
+}
+
+fn remove_output_if_exists(root_dir: &Path, relative_path: &str) -> Result<()> {
+    if relative_path.is_empty() {
+        return Ok(());
+    }
+
+    let path = root_dir.join(relative_path);
+    if path.exists() {
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to remove stale output {}", path.display()))?;
     }
 
     Ok(())
@@ -252,21 +356,13 @@ fn process_one(
     root_dir: &Path,
     originals_dir: &Path,
     thumbnails_dir: &Path,
-    original_path: &Path,
-    original_size: u64,
-    original_mtime_ms: u128,
+    avif_threads: usize,
+    item: &SourceItem,
 ) -> Result<ProcessedPhoto> {
-    let relative = original_path.strip_prefix(originals_dir).with_context(|| {
-        format!(
-            "failed to strip originals prefix from {}",
-            original_path.display()
-        )
-    })?;
+    let image = load_image(&item.path)
+        .with_context(|| format!("failed to decode {}", item.path.display()))?;
 
-    let image = load_image(original_path)
-        .with_context(|| format!("failed to decode {}", original_path.display()))?;
-
-    let thumbnail_path = build_thumbnail_path(thumbnails_dir, config, relative);
+    let thumbnail_path = build_thumbnail_path(thumbnails_dir, config, &item.relative_path);
     if let Some(parent) = thumbnail_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -281,6 +377,17 @@ fn process_one(
     )
     .with_context(|| format!("failed to write {}", thumbnail_path.display()))?;
 
+    let original_path = build_original_path(originals_dir, &item.relative_path);
+    if let Some(parent) = original_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    save_original_avif(&image, &original_path, avif_threads)
+        .with_context(|| format!("failed to write {}", original_path.display()))?;
+
+    let original_metadata = fs::metadata(&original_path)
+        .with_context(|| format!("failed to read metadata for {}", original_path.display()))?;
     let thumbnail_metadata = fs::metadata(&thumbnail_path)
         .with_context(|| format!("failed to read metadata for {}", thumbnail_path.display()))?;
     let (original_width, original_height) = image.dimensions();
@@ -292,18 +399,20 @@ fn process_one(
         None
     };
 
-    let original_key = normalize_relative_path(root_dir, original_path)?;
+    let original_key = normalize_relative_path(root_dir, &original_path)?;
     let thumbnail_key = normalize_relative_path(root_dir, &thumbnail_path)?;
-    let title = original_path
+    let title = item
+        .path
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
-        .ok_or_else(|| anyhow!("missing file stem for {}", original_path.display()))?;
+        .ok_or_else(|| anyhow!("missing file stem for {}", item.path.display()))?;
 
     Ok(ProcessedPhoto {
-        state_key: original_key.clone(),
+        state_key: item.source_key.clone(),
         state_entry: StateEntry {
-            size: original_size,
-            mtime_ms: original_mtime_ms,
+            size: item.size,
+            mtime_ms: item.mtime_ms,
+            original: original_key.clone(),
             thumbnail: thumbnail_key.clone(),
             processed_at: now_rfc3339()?,
         },
@@ -312,8 +421,8 @@ fn process_one(
                 url: original_key,
                 width: Some(original_width),
                 height: Some(original_height),
-                bytes: original_size,
-                mime: mime_from_extension(original_path),
+                bytes: original_metadata.len(),
+                mime: AVIF_MIME.to_string(),
             },
             thumbnail: Asset {
                 url: thumbnail_key,
@@ -412,6 +521,26 @@ fn decode_heif_image(path: &Path) -> Result<DynamicImage> {
     Ok(DynamicImage::ImageRgb8(rgb))
 }
 
+fn save_original_avif(image: &DynamicImage, path: &Path, avif_threads: usize) -> Result<()> {
+    let rgba = image.to_rgba8();
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let writer = BufWriter::new(file);
+    let encoder = AvifEncoder::new_with_speed_quality(writer, AVIF_SPEED, AVIF_QUALITY)
+        .with_num_threads(Some(avif_threads));
+
+    encoder
+        .write_image(
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .with_context(|| format!("failed to encode AVIF {}", path.display()))?;
+
+    Ok(())
+}
+
 fn save_thumbnail(
     image: &DynamicImage,
     path: &Path,
@@ -453,12 +582,14 @@ fn compute_blurhash(image: &DynamicImage) -> Result<String> {
         .map_err(|error| anyhow!("failed to encode blurhash: {error}"))
 }
 
-fn build_thumbnail_path(
-    thumbnails_dir: &Path,
-    config: &Config,
-    relative_original: &Path,
-) -> PathBuf {
-    let mut path = thumbnails_dir.join(relative_original);
+fn build_original_path(originals_dir: &Path, relative_source: &Path) -> PathBuf {
+    let mut path = originals_dir.join(relative_source);
+    path.set_extension(AVIF_EXTENSION);
+    path
+}
+
+fn build_thumbnail_path(thumbnails_dir: &Path, config: &Config, relative_source: &Path) -> PathBuf {
+    let mut path = thumbnails_dir.join(relative_source);
     path.set_extension(config.thumbnail_format.extension());
     path
 }
@@ -493,7 +624,16 @@ fn recommended_parallelism() -> usize {
         n => available.min(n),
     };
 
-    ((baseline * 3) / 4).max(1)
+    (baseline / 2).clamp(1, 8)
+}
+
+fn recommended_avif_threads(worker_count: usize, total_jobs: usize) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let concurrent_jobs = total_jobs.max(1).min(worker_count.max(1));
+
+    (available / concurrent_jobs).clamp(1, 4)
 }
 
 fn progress_style() -> Result<ProgressStyle> {
@@ -551,10 +691,10 @@ fn now_rfc3339() -> Result<String> {
     Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
 }
 
-fn normalize_relative_path(root_dir: &Path, path: &Path) -> Result<String> {
+fn normalize_relative_path(base_dir: &Path, path: &Path) -> Result<String> {
     let relative = path
-        .strip_prefix(root_dir)
-        .with_context(|| format!("failed to strip root prefix from {}", path.display()))?;
+        .strip_prefix(base_dir)
+        .with_context(|| format!("failed to strip prefix from {}", path.display()))?;
 
     Ok(relative
         .components()
@@ -585,21 +725,6 @@ fn is_heif_family(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn mime_from_extension(path: &Path) -> String {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .map(|extension| match extension.as_str() {
-            "jpg" | "jpeg" => "image/jpeg",
-            "png" => "image/png",
-            "webp" => "image/webp",
-            "heif" | "heic" | "hif" => "image/heif",
-            _ => "application/octet-stream",
-        })
-        .unwrap_or("application/octet-stream")
-        .to_string()
-}
-
 fn mime_from_format(format: ThumbnailFormat) -> &'static str {
     match format {
         ThumbnailFormat::Jpeg => "image/jpeg",
@@ -608,9 +733,10 @@ fn mime_from_format(format: ThumbnailFormat) -> &'static str {
     }
 }
 
-struct OriginalItem {
+struct SourceItem {
     path: PathBuf,
-    original_key: String,
+    relative_path: PathBuf,
+    source_key: String,
     size: u64,
     mtime_ms: u128,
 }
@@ -674,6 +800,8 @@ struct StateEntry {
     size: u64,
     #[serde(rename = "mtimeMs")]
     mtime_ms: u128,
+    #[serde(default)]
+    original: String,
     thumbnail: String,
     #[serde(rename = "processedAt")]
     processed_at: String,

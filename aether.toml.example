@@ -1,6 +1,8 @@
-path = "."
-originals_dir = "./originals"
-thumbnails_dir = "./.thumbnails"
+sourcePath = "/absolute/path/to/photos"
+targetPath = "/absolute/path/to/output"
+sourceTags = ["Aether"]
+originals_dir = "gallery"
+thumbnails_dir = "thumbnails"
 thumbnail_width = 640
 thumbnail_format = "webp"
 thumbnail_quality = 82
