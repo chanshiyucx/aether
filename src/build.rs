@@ -1,18 +1,21 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs,
     fs::File,
-    io::{BufWriter, Cursor, Write},
+    io::{BufReader, BufWriter, Cursor, Write},
     path::{Path, PathBuf},
+    process::Command,
     time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use blurhash::encode;
+use exif::{DateTime as ExifDateTime, Exif, In, Reader as ExifReader, Tag, Value};
 use fast_image_resize as fr;
 use image::{
-    ColorType, DynamicImage, GenericImageView, ImageBuffer, ImageFormat, ImageReader, Rgb, Rgba,
-    codecs::jpeg::JpegEncoder,
+    ColorType, DynamicImage, GenericImageView, ImageBuffer, ImageDecoder, ImageFormat, ImageReader,
+    Rgb, Rgba, codecs::jpeg::JpegEncoder, metadata::Orientation,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
@@ -31,7 +34,11 @@ const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heif", "h
 const FINDER_TAGS_XATTR: &str = "com.apple.metadata:_kMDItemUserTags";
 const AVIF_EXTENSION: &str = "avif";
 const AVIF_MIME: &str = "image/avif";
-const AVIF_SPEED: u8 = 8;
+const PIPELINE_VERSION: u16 = 5;
+const AVIF_SPEED: u8 = 5;
+const BT709: [f32; 3] = [0.2126, 0.7152, 0.0722];
+const BLURHASH_LONG_SIDE: u32 = 96;
+const BLURHASH_BLUR_SIGMA: f32 = 2.0;
 
 pub enum BuildExit {
     Success,
@@ -105,9 +112,13 @@ pub fn run() -> Result<BuildExit> {
     let mut reused_count = 0usize;
 
     for item in sources {
-        if let Some((photo, state_entry)) =
-            try_reuse(&root_dir, &item, &previous_manifest, &previous_state)
-        {
+        if let Some((photo, state_entry)) = try_reuse(
+            &root_dir,
+            &item,
+            &previous_manifest,
+            &previous_state,
+            config.enable_blurhash,
+        ) {
             progress.inc(1);
             photos.push(photo);
             files.insert(item.source_key, state_entry);
@@ -297,9 +308,14 @@ fn try_reuse(
     item: &SourceItem,
     previous_manifest: &LoadedManifest,
     previous_state: &StateFile,
+    enable_blurhash: bool,
 ) -> Option<(PhotoEntry, StateEntry)> {
     let state_entry = previous_state.files.get(&item.source_key)?;
     if state_entry.original.is_empty() {
+        return None;
+    }
+
+    if state_entry.pipeline_version != PIPELINE_VERSION {
         return None;
     }
 
@@ -319,7 +335,11 @@ fn try_reuse(
         return None;
     }
 
-    Some((photo_entry.clone(), state_entry.clone()))
+    let mut photo_entry = photo_entry.clone();
+    refresh_photo_metadata(item, &mut photo_entry);
+    refresh_photo_blurhash(root_dir, &mut photo_entry, enable_blurhash);
+
+    Some((photo_entry, state_entry.clone()))
 }
 
 fn cleanup_removed_outputs(
@@ -362,8 +382,11 @@ fn process_one(
     avif_threads: usize,
     item: &SourceItem,
 ) -> Result<ProcessedPhoto> {
-    let loaded = load_image(&item.path)
+    let exif = read_exif(&item.path);
+    let source_orientation = source_orientation(exif.as_ref());
+    let mut loaded = load_image(&item.path)
         .with_context(|| format!("failed to decode {}", item.path.display()))?;
+    apply_source_orientation(&mut loaded.image, source_orientation);
     let image = &loaded.image;
 
     let thumbnail_path = build_thumbnail_path(thumbnails_dir, config, &item.relative_path);
@@ -372,7 +395,8 @@ fn process_one(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let thumbnail_image = resize_image(&image, config.thumbnail_width)?;
+    let preview_image = build_preview_image(&item.path, &loaded, config.thumbnail_width)?;
+    let thumbnail_image = resize_image(&preview_image, config.thumbnail_width)?;
     save_thumbnail(
         &thumbnail_image,
         &thumbnail_path,
@@ -410,10 +434,12 @@ fn process_one(
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .ok_or_else(|| anyhow!("missing file stem for {}", item.path.display()))?;
+    let extracted = extract_source_metadata(exif.as_ref(), Some(loaded.bit_depth));
 
     Ok(ProcessedPhoto {
         state_key: item.source_key.clone(),
         state_entry: StateEntry {
+            pipeline_version: PIPELINE_VERSION,
             size: item.size,
             mtime_ms: item.mtime_ms,
             original: original_key.clone(),
@@ -437,12 +463,498 @@ fn process_one(
             },
             blurhash,
             title,
-            taken_at: None,
-            location: None,
-            camera: None,
-            image: None,
+            taken_at: extracted.taken_at,
+            location: extracted.location,
+            camera: extracted.camera,
+            image: Some(extracted.image),
         },
     })
+}
+
+fn refresh_photo_metadata(item: &SourceItem, photo_entry: &mut PhotoEntry) {
+    if let Some(stem) = item.path.file_stem() {
+        photo_entry.title = stem.to_string_lossy().into_owned();
+    }
+
+    let exif = read_exif(&item.path);
+    let extracted = extract_source_metadata(exif.as_ref(), probe_source_bit_depth(&item.path));
+    photo_entry.taken_at = extracted.taken_at;
+    photo_entry.location = extracted.location;
+    photo_entry.camera = extracted.camera;
+    photo_entry.image = Some(extracted.image);
+}
+
+fn refresh_photo_blurhash(root_dir: &Path, photo_entry: &mut PhotoEntry, enable_blurhash: bool) {
+    if !enable_blurhash {
+        photo_entry.blurhash = None;
+        return;
+    }
+
+    let thumbnail_path = root_dir.join(&photo_entry.thumbnail.url);
+    match load_raster_image(&thumbnail_path).and_then(|image| compute_blurhash(&image)) {
+        Ok(blurhash) => photo_entry.blurhash = Some(blurhash),
+        Err(error) => warn!(
+            "failed to refresh blurhash from {}: {error:#}",
+            thumbnail_path.display()
+        ),
+    }
+}
+
+fn extract_source_metadata(exif: Option<&Exif>, bit_depth: Option<u8>) -> ExtractedMetadata {
+    let source_orientation = source_orientation(exif);
+
+    ExtractedMetadata {
+        taken_at: exif.and_then(extract_taken_at),
+        location: exif.and_then(extract_location),
+        camera: exif.and_then(extract_camera),
+        image: extract_image_metadata(exif, bit_depth, source_orientation),
+    }
+}
+
+fn read_exif(path: &Path) -> Option<Exif> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            warn!(
+                "failed to open {} for EXIF extraction: {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let mut reader = BufReader::new(file);
+    let mut exif_reader = ExifReader::new();
+    exif_reader.continue_on_error(true);
+
+    match exif_reader
+        .read_from_container(&mut reader)
+        .or_else(|error| {
+            error.distill_partial_result(|errors| {
+                for partial in errors {
+                    warn!("partial EXIF parse for {}: {partial}", path.display());
+                }
+            })
+        }) {
+        Ok(exif) => Some(exif),
+        Err(exif::Error::NotFound(_)) => None,
+        Err(exif::Error::InvalidFormat(_)) => None,
+        Err(error) => {
+            warn!("failed to parse EXIF for {}: {error}", path.display());
+            None
+        }
+    }
+}
+
+fn load_raster_image(path: &Path) -> Result<DynamicImage> {
+    ImageReader::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("failed to guess image format for {}", path.display()))?
+        .decode()
+        .with_context(|| format!("failed to decode {}", path.display()))
+}
+
+fn extract_taken_at(exif: &Exif) -> Option<String> {
+    let (date_tag, subsec_tag, offset_tag) =
+        if exif.get_field(Tag::DateTimeOriginal, In::PRIMARY).is_some() {
+            (
+                Tag::DateTimeOriginal,
+                Some(Tag::SubSecTimeOriginal),
+                Some(Tag::OffsetTimeOriginal),
+            )
+        } else if exif
+            .get_field(Tag::DateTimeDigitized, In::PRIMARY)
+            .is_some()
+        {
+            (
+                Tag::DateTimeDigitized,
+                Some(Tag::SubSecTimeDigitized),
+                Some(Tag::OffsetTimeDigitized),
+            )
+        } else {
+            (Tag::DateTime, Some(Tag::SubSecTime), Some(Tag::OffsetTime))
+        };
+
+    let mut datetime = ExifDateTime::from_ascii(exif_ascii(exif, date_tag)?).ok()?;
+
+    if let Some(tag) = subsec_tag {
+        if let Some(value) = exif_ascii(exif, tag) {
+            let _ = datetime.parse_subsec(value);
+        }
+    }
+
+    if let Some(tag) = offset_tag {
+        if let Some(value) = exif_ascii(exif, tag) {
+            let _ = datetime.parse_offset(value);
+        }
+    }
+
+    Some(format_exif_datetime(&datetime))
+}
+
+fn extract_location(exif: &Exif) -> Option<Location> {
+    let lat_values = rational_triplet(exif, Tag::GPSLatitude)?;
+    let lng_values = rational_triplet(exif, Tag::GPSLongitude)?;
+    let lat_ref = exif_text(exif, Tag::GPSLatitudeRef)?;
+    let lng_ref = exif_text(exif, Tag::GPSLongitudeRef)?;
+
+    let lat = signed_gps_coordinate(lat_values, &lat_ref)?;
+    let lng = signed_gps_coordinate(lng_values, &lng_ref)?;
+    let alt = rational_value(exif, Tag::GPSAltitude).map(|value| {
+        let altitude_ref = exif_uint(exif, Tag::GPSAltitudeRef).unwrap_or(0);
+        if altitude_ref == 1 { -value } else { value }
+    });
+
+    Some(Location {
+        lat,
+        lng,
+        alt,
+        country: None,
+        city: None,
+    })
+}
+
+fn extract_camera(exif: &Exif) -> Option<Camera> {
+    let make = exif_text(exif, Tag::Make);
+    let model = exif_text(exif, Tag::Model);
+    let lens = exif_text(exif, Tag::LensModel).or_else(|| exif_text(exif, Tag::LensMake));
+    let focal_length_mm = rational_value(exif, Tag::FocalLength).map(round_f32);
+    let focal_length_in_35mm =
+        exif_uint(exif, Tag::FocalLengthIn35mmFilm).map(|value| value as u32);
+    let aperture = rational_value(exif, Tag::FNumber).map(round_f32);
+    let max_aperture = extract_max_aperture(exif);
+    let shutter = exif_display(exif, Tag::ExposureTime);
+    let iso = exif_uint(exif, Tag::PhotographicSensitivity)
+        .or_else(|| exif_uint(exif, Tag::ISOSpeed))
+        .map(|value| value as u32);
+    let exposure_program = exif_display(exif, Tag::ExposureProgram);
+    let exposure_mode = compact_exposure_mode(exif);
+    let metering_mode = exif_display(exif, Tag::MeteringMode);
+    let white_balance = compact_white_balance(exif);
+    let flash = compact_flash(exif);
+    let light_source = exif_display(exif, Tag::LightSource);
+    let scene_capture_type = exif_display(exif, Tag::SceneCaptureType);
+    let brightness_ev = rational_value(exif, Tag::BrightnessValue).map(round_f32);
+    let sensing_method = exif_display(exif, Tag::SensingMethod);
+
+    if make.is_none()
+        && model.is_none()
+        && lens.is_none()
+        && focal_length_mm.is_none()
+        && focal_length_in_35mm.is_none()
+        && aperture.is_none()
+        && max_aperture.is_none()
+        && shutter.is_none()
+        && iso.is_none()
+        && exposure_program.is_none()
+        && exposure_mode.is_none()
+        && metering_mode.is_none()
+        && white_balance.is_none()
+        && flash.is_none()
+        && light_source.is_none()
+        && scene_capture_type.is_none()
+        && brightness_ev.is_none()
+        && sensing_method.is_none()
+    {
+        return None;
+    }
+
+    Some(Camera {
+        make,
+        model,
+        lens,
+        focal_length_mm,
+        focal_length_in_35mm,
+        aperture,
+        max_aperture,
+        shutter,
+        iso,
+        exposure_program,
+        exposure_mode,
+        metering_mode,
+        white_balance,
+        flash,
+        light_source,
+        scene_capture_type,
+        brightness_ev,
+        sensing_method,
+    })
+}
+
+fn extract_image_metadata(
+    exif: Option<&Exif>,
+    bit_depth: Option<u8>,
+    source_orientation: u8,
+) -> ImageMetadata {
+    let has_hdr = bit_depth.map(|value| value > 8).unwrap_or(false);
+    let color_space = exif
+        .and_then(|exif| exif_display(exif, Tag::ColorSpace))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Unspecified".to_string());
+
+    ImageMetadata {
+        orientation: 1,
+        color_space,
+        has_hdr,
+        is_live_photo: false,
+        bit_depth,
+        source_orientation: (source_orientation != 1).then_some(source_orientation),
+    }
+}
+
+fn probe_source_bit_depth(path: &Path) -> Option<u8> {
+    if is_heif_family(path) {
+        return probe_heif_bit_depth(path)
+            .inspect_err(|error| {
+                warn!(
+                    "failed to probe HEIF bit depth for {}: {error:#}",
+                    path.display()
+                );
+            })
+            .ok();
+    }
+
+    probe_generic_bit_depth(path)
+        .inspect_err(|error| {
+            warn!(
+                "failed to probe bit depth for {}: {error:#}",
+                path.display()
+            );
+        })
+        .ok()
+}
+
+fn probe_heif_bit_depth(path: &Path) -> Result<u8> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?;
+    let context = HeifContext::read_from_file(path_str)
+        .with_context(|| format!("failed to open HEIF container {}", path.display()))?;
+    let handle = context
+        .primary_image_handle()
+        .with_context(|| format!("failed to read primary image handle {}", path.display()))?;
+
+    Ok(handle
+        .luma_bits_per_pixel()
+        .max(handle.chroma_bits_per_pixel()))
+}
+
+fn probe_generic_bit_depth(path: &Path) -> Result<u8> {
+    let decoder = ImageReader::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("failed to guess image format for {}", path.display()))?
+        .into_decoder()
+        .with_context(|| format!("failed to create decoder for {}", path.display()))?;
+
+    Ok(match decoder.color_type() {
+        ColorType::L16 | ColorType::La16 | ColorType::Rgb16 | ColorType::Rgba16 => 16,
+        _ => 8,
+    })
+}
+
+fn exif_ascii<'a>(exif: &'a Exif, tag: Tag) -> Option<&'a [u8]> {
+    match &exif.get_field(tag, In::PRIMARY)?.value {
+        Value::Ascii(values) => values.first().map(|value| value.as_slice()),
+        _ => None,
+    }
+}
+
+fn exif_text(exif: &Exif, tag: Tag) -> Option<String> {
+    let raw = exif_ascii(exif, tag)?;
+    let text = String::from_utf8_lossy(raw)
+        .trim_matches('\0')
+        .trim()
+        .to_string();
+
+    (!text.is_empty()).then_some(text)
+}
+
+fn exif_display(exif: &Exif, tag: Tag) -> Option<String> {
+    let text = exif
+        .get_field(tag, In::PRIMARY)?
+        .display_value()
+        .to_string();
+    let text = text.trim();
+    (!text.is_empty() && text != "unknown").then(|| text.to_string())
+}
+
+fn exif_uint(exif: &Exif, tag: Tag) -> Option<u32> {
+    exif.get_field(tag, In::PRIMARY)?.value.get_uint(0)
+}
+
+fn extract_max_aperture(exif: &Exif) -> Option<f32> {
+    exif_apex_aperture(exif, Tag::MaxApertureValue)
+        .or_else(|| lens_specification_max_aperture(exif))
+        .map(round_f32)
+}
+
+fn compact_exposure_mode(exif: &Exif) -> Option<String> {
+    if let Some(value) = exif_uint(exif, Tag::ExposureMode) {
+        return match value {
+            0 => Some("auto".to_string()),
+            1 => Some("manual".to_string()),
+            2 => Some("bracket".to_string()),
+            _ => None,
+        };
+    }
+
+    exif_display(exif, Tag::ExposureMode).and_then(|value| {
+        let normalized = value.to_ascii_lowercase();
+        if normalized.contains("manual") {
+            Some("manual".to_string())
+        } else if normalized.contains("bracket") {
+            Some("bracket".to_string())
+        } else if normalized.contains("auto") {
+            Some("auto".to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn compact_white_balance(exif: &Exif) -> Option<String> {
+    if let Some(value) = exif_uint(exif, Tag::WhiteBalance) {
+        return match value {
+            0 => Some("auto".to_string()),
+            1 => Some("manual".to_string()),
+            _ => None,
+        };
+    }
+
+    exif_display(exif, Tag::WhiteBalance).and_then(|value| {
+        let normalized = value.to_ascii_lowercase();
+        if normalized.contains("manual") {
+            Some("manual".to_string())
+        } else if normalized.contains("auto") {
+            Some("auto".to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn compact_flash(exif: &Exif) -> Option<String> {
+    if let Some(value) = exif_uint(exif, Tag::Flash) {
+        let no_function = value & 0x20 != 0;
+        let red_eye = value & 0x40 != 0;
+        let fired = value & 0x01 != 0;
+        let mode = value & 0x18;
+
+        return Some(
+            match () {
+                _ if no_function => "unsupported",
+                _ if mode == 0x18 && fired => "auto-fired",
+                _ if mode == 0x18 => "auto",
+                _ if red_eye && fired => "red-eye",
+                _ if mode == 0x10 => "off",
+                _ if fired || mode == 0x08 => "on",
+                _ => "off",
+            }
+            .to_string(),
+        );
+    }
+
+    exif_display(exif, Tag::Flash).and_then(|value| {
+        let normalized = value.to_ascii_lowercase();
+        if normalized.contains("no flash function") {
+            Some("unsupported".to_string())
+        } else if normalized.contains("red-eye") {
+            Some("red-eye".to_string())
+        } else if normalized.contains("auto") && normalized.contains("fired") {
+            Some("auto-fired".to_string())
+        } else if normalized.contains("auto") {
+            Some("auto".to_string())
+        } else if normalized.contains("not fired") || normalized.contains("suppressed") {
+            Some("off".to_string())
+        } else if normalized.contains("fired") {
+            Some("on".to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn exif_apex_aperture(exif: &Exif, tag: Tag) -> Option<f64> {
+    let apex = rational_value(exif, tag)?;
+    (apex.is_finite()).then(|| 2_f64.powf(apex / 2.0))
+}
+
+fn lens_specification_max_aperture(exif: &Exif) -> Option<f64> {
+    match &exif.get_field(Tag::LensSpecification, In::PRIMARY)?.value {
+        Value::Rational(values) if values.len() >= 4 => [values[2].to_f64(), values[3].to_f64()]
+            .into_iter()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .reduce(f64::min),
+        _ => None,
+    }
+}
+
+fn rational_value(exif: &Exif, tag: Tag) -> Option<f64> {
+    match &exif.get_field(tag, In::PRIMARY)?.value {
+        Value::Rational(values) => values.first().map(|value| value.to_f64()),
+        Value::SRational(values) => values.first().map(|value| value.to_f64()),
+        _ => None,
+    }
+}
+
+fn rational_triplet(exif: &Exif, tag: Tag) -> Option<[f64; 3]> {
+    match &exif.get_field(tag, In::PRIMARY)?.value {
+        Value::Rational(values) if values.len() >= 3 => {
+            Some([values[0].to_f64(), values[1].to_f64(), values[2].to_f64()])
+        }
+        _ => None,
+    }
+}
+
+fn signed_gps_coordinate(parts: [f64; 3], direction: &str) -> Option<f64> {
+    let mut value = parts[0] + (parts[1] / 60.0) + (parts[2] / 3600.0);
+    match direction.trim().to_ascii_uppercase().as_str() {
+        "N" | "E" => Some(value),
+        "S" | "W" => {
+            value = -value;
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+fn format_exif_datetime(datetime: &ExifDateTime) -> String {
+    let mut formatted = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        datetime.year,
+        datetime.month,
+        datetime.day,
+        datetime.hour,
+        datetime.minute,
+        datetime.second
+    );
+
+    if let Some(nanos) = datetime.nanosecond {
+        let mut fraction = format!("{nanos:09}");
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+        if !fraction.is_empty() {
+            formatted.push('.');
+            formatted.push_str(&fraction);
+        }
+    }
+
+    if let Some(offset_minutes) = datetime.offset {
+        let sign = if offset_minutes >= 0 { '+' } else { '-' };
+        let total = offset_minutes.unsigned_abs();
+        let hours = total / 60;
+        let minutes = total % 60;
+        formatted.push(sign);
+        formatted.push_str(&format!("{hours:02}:{minutes:02}"));
+    }
+
+    formatted
+}
+
+fn round_f32(value: f64) -> f32 {
+    ((value * 100.0).round() / 100.0) as f32
 }
 
 fn resize_image(image: &DynamicImage, target_width: u32) -> Result<DynamicImage> {
@@ -453,7 +965,30 @@ fn resize_image(image: &DynamicImage, target_width: u32) -> Result<DynamicImage>
 
     let ratio = target_width as f64 / width as f64;
     let target_height = (image.height() as f64 * ratio).round() as u32;
-    let target_height = target_height.max(1);
+    resize_to_dimensions(image, target_width, target_height.max(1))
+}
+
+fn resize_to_fit(image: &DynamicImage, max_width: u32, max_height: u32) -> Result<DynamicImage> {
+    let width = image.width();
+    let height = image.height();
+    if width <= max_width && height <= max_height {
+        return Ok(image.clone());
+    }
+
+    let width_ratio = max_width as f64 / width as f64;
+    let height_ratio = max_height as f64 / height as f64;
+    let ratio = width_ratio.min(height_ratio);
+    let target_width = ((width as f64 * ratio).round() as u32).max(1);
+    let target_height = ((height as f64 * ratio).round() as u32).max(1);
+
+    resize_to_dimensions(image, target_width, target_height)
+}
+
+fn resize_to_dimensions(
+    image: &DynamicImage,
+    target_width: u32,
+    target_height: u32,
+) -> Result<DynamicImage> {
     let src = image.to_rgba8();
     let src_width = src.width();
     let src_height = src.height();
@@ -492,6 +1027,7 @@ fn load_image(path: &Path) -> Result<LoadedImage> {
 
     Ok(LoadedImage {
         bit_depth: inferred_bit_depth(&image),
+        has_alpha: image.has_alpha(),
         image,
     })
 }
@@ -564,7 +1100,11 @@ fn decode_heif_image(path: &Path) -> Result<LoadedImage> {
             DynamicImage::ImageRgb16(rgb)
         };
 
-        return Ok(LoadedImage { image, bit_depth });
+        return Ok(LoadedImage {
+            image,
+            bit_depth,
+            has_alpha,
+        });
     }
 
     let channels = if has_alpha { 4usize } else { 3usize };
@@ -592,6 +1132,7 @@ fn decode_heif_image(path: &Path) -> Result<LoadedImage> {
     Ok(LoadedImage {
         image,
         bit_depth: 8,
+        has_alpha,
     })
 }
 
@@ -601,26 +1142,27 @@ fn save_original_avif(
     avif_quality: u8,
     avif_threads: usize,
 ) -> Result<()> {
-    let encoder = RavifEncoder::new()
-        .with_quality(f32::from(avif_quality))
-        .with_alpha_quality(f32::from(avif_quality))
-        .with_speed(AVIF_SPEED)
-        .with_bit_depth(AvifBitDepth::Ten)
-        .with_internal_color_model(AvifColorModel::RGB)
-        .with_num_threads(Some(avif_threads));
-
     let avif_file = if loaded.bit_depth > 8 {
+        let encoder = RavifEncoder::new()
+            .with_quality(f32::from(avif_quality))
+            .with_alpha_quality(f32::from(avif_quality))
+            .with_speed(AVIF_SPEED)
+            .with_bit_depth(AvifBitDepth::Ten)
+            .with_internal_color_model(AvifColorModel::YCbCr)
+            .with_num_threads(Some(avif_threads));
         let rgba = loaded.image.to_rgba16();
         let width = rgba.width() as usize;
         let height = rgba.height() as usize;
         let bit_depth = loaded.bit_depth.min(16).max(10);
-        let has_alpha = rgba.pixels().any(|pixel| pixel.0[3] != u16::MAX);
         let planes = rgba.pixels().map(|pixel| {
-            [
-                scale_to_ten(pixel.0[1], bit_depth),
-                scale_to_ten(pixel.0[2], bit_depth),
-                scale_to_ten(pixel.0[0], bit_depth),
-            ]
+            rgb16_to_10_bit_ycbcr(
+                [
+                    scale_to_ten(pixel.0[0], bit_depth),
+                    scale_to_ten(pixel.0[1], bit_depth),
+                    scale_to_ten(pixel.0[2], bit_depth),
+                ],
+                BT709,
+            )
         });
 
         encoder
@@ -628,21 +1170,27 @@ fn save_original_avif(
                 width,
                 height,
                 planes,
-                has_alpha.then(|| {
+                loaded.has_alpha.then(|| {
                     rgba.pixels()
                         .map(|pixel| scale_to_ten(pixel.0[3], bit_depth))
                 }),
                 ravif::PixelRange::Full,
-                ravif::MatrixCoefficients::Identity,
+                ravif::MatrixCoefficients::BT709,
             )
             .map_err(|error| anyhow!("failed to encode 10-bit AVIF: {error}"))?
             .avif_file
     } else {
+        let encoder = RavifEncoder::new()
+            .with_quality(f32::from(avif_quality))
+            .with_alpha_quality(f32::from(avif_quality))
+            .with_speed(AVIF_SPEED)
+            .with_bit_depth(AvifBitDepth::Ten)
+            .with_internal_color_model(AvifColorModel::RGB)
+            .with_num_threads(Some(avif_threads));
         let rgba = loaded.image.to_rgba8();
-        let pixels = rgba.as_raw().as_rgba();
         encoder
             .encode_rgba(Img::new(
-                pixels,
+                rgba.as_raw().as_rgba(),
                 rgba.width() as usize,
                 rgba.height() as usize,
             ))
@@ -687,13 +1235,155 @@ fn save_thumbnail(
 }
 
 fn compute_blurhash(image: &DynamicImage) -> Result<String> {
-    let reduced = image.thumbnail(32, 32).to_rgba8();
-    let width = reduced.width();
-    let height = reduced.height();
-    let pixels = reduced.into_raw();
+    let reduced = resize_to_fit(
+        image,
+        blurhash_target_width(image.width(), image.height()),
+        blurhash_target_height(image.width(), image.height()),
+    )?;
+    let softened = reduced.blur(BLURHASH_BLUR_SIGMA).to_rgba8();
+    let width = softened.width();
+    let height = softened.height();
+    let pixels = softened.into_raw();
+    let (components_x, components_y) = blurhash_components(width, height);
 
-    encode(4, 3, width, height, &pixels)
+    encode(components_x, components_y, width, height, &pixels)
         .map_err(|error| anyhow!("failed to encode blurhash: {error}"))
+}
+
+fn blurhash_target_width(width: u32, height: u32) -> u32 {
+    if width >= height {
+        BLURHASH_LONG_SIDE
+    } else {
+        ((width as u64 * BLURHASH_LONG_SIDE as u64 + (height as u64 / 2)) / height as u64).max(1)
+            as u32
+    }
+}
+
+fn blurhash_target_height(width: u32, height: u32) -> u32 {
+    if height >= width {
+        BLURHASH_LONG_SIDE
+    } else {
+        ((height as u64 * BLURHASH_LONG_SIDE as u64 + (width as u64 / 2)) / width as u64).max(1)
+            as u32
+    }
+}
+
+fn blurhash_components(width: u32, height: u32) -> (u32, u32) {
+    let aspect_ratio = width as f32 / height.max(1) as f32;
+
+    if aspect_ratio >= 1.35 {
+        (5, 4)
+    } else if aspect_ratio <= 0.74 {
+        (4, 5)
+    } else {
+        (4, 4)
+    }
+}
+
+fn build_preview_image(
+    source_path: &Path,
+    loaded: &LoadedImage,
+    target_width: u32,
+) -> Result<DynamicImage> {
+    if cfg!(target_os = "macos") {
+        let preview_width = loaded.image.width().min(target_width).max(1);
+        match build_preview_image_with_sips(source_path, preview_width) {
+            Ok(image) => return Ok(image),
+            Err(error) => warn!(
+                "failed to build preview with sips for {}: {error:#}; falling back to internal preview pipeline",
+                source_path.display()
+            ),
+        }
+    }
+
+    build_preview_image_fallback(loaded)
+}
+
+fn build_preview_image_fallback(loaded: &LoadedImage) -> Result<DynamicImage> {
+    if loaded.bit_depth <= 8 {
+        return Ok(DynamicImage::ImageRgba8(loaded.image.to_rgba8()));
+    }
+
+    let source_bit_depth = loaded.bit_depth.clamp(9, 16);
+    let rgba16 = loaded.image.to_rgba16();
+    let pixels = rgba16
+        .pixels()
+        .flat_map(|pixel| {
+            pixel
+                .0
+                .iter()
+                .map(|component| scale_to_eight(*component, source_bit_depth))
+        })
+        .collect::<Vec<_>>();
+
+    let buffer =
+        ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(rgba16.width(), rgba16.height(), pixels)
+            .ok_or_else(|| anyhow!("failed to build preview RGBA image buffer"))?;
+
+    Ok(DynamicImage::ImageRgba8(buffer))
+}
+
+fn build_preview_image_with_sips(source_path: &Path, target_width: u32) -> Result<DynamicImage> {
+    let preview_path = temporary_preview_path("png");
+    let output = Command::new("sips")
+        .arg("--optimizeColorForSharing")
+        .arg("--resampleWidth")
+        .arg(target_width.to_string())
+        .arg("-s")
+        .arg("format")
+        .arg("png")
+        .arg(source_path)
+        .arg("--out")
+        .arg(&preview_path)
+        .output()
+        .with_context(|| format!("failed to launch sips for {}", source_path.display()))?;
+
+    if !output.status.success() {
+        let _ = fs::remove_file(&preview_path);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!("sips failed for {}", source_path.display());
+        }
+        bail!("sips failed for {}: {stderr}", source_path.display());
+    }
+
+    let image = ImageReader::open(&preview_path)
+        .with_context(|| format!("failed to open preview {}", preview_path.display()))?
+        .with_guessed_format()
+        .with_context(|| {
+            format!(
+                "failed to guess preview format for {}",
+                preview_path.display()
+            )
+        })?
+        .decode()
+        .with_context(|| format!("failed to decode preview {}", preview_path.display()))?;
+
+    let _ = fs::remove_file(&preview_path);
+    Ok(image)
+}
+
+fn temporary_preview_path(extension: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let mut filename = OsString::from(format!("aether-preview-{}-{nanos}", std::process::id()));
+    filename.push(".");
+    filename.push(extension);
+    std::env::temp_dir().join(filename)
+}
+
+fn source_orientation(exif: Option<&Exif>) -> u8 {
+    exif.and_then(|exif| exif_uint(exif, Tag::Orientation))
+        .and_then(|value| u8::try_from(value).ok())
+        .unwrap_or(1)
+}
+
+fn apply_source_orientation(image: &mut DynamicImage, source_orientation: u8) {
+    if let Some(orientation) = Orientation::from_exif(source_orientation) {
+        image.apply_orientation(orientation);
+    }
 }
 
 fn build_original_path(originals_dir: &Path, relative_source: &Path) -> PathBuf {
@@ -751,11 +1441,9 @@ fn recommended_avif_threads(worker_count: usize, total_jobs: usize) -> usize {
 }
 
 fn progress_style() -> Result<ProgressStyle> {
-    ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
-    )
-    .map(|style| style.progress_chars("=>-"))
-    .map_err(|error| anyhow!("failed to configure progress bar: {error}"))
+    ProgressStyle::with_template("{spinner:.green} [{wide_bar:.cyan/blue}] {pos}/{len} {msg}")
+        .map(|style| style.progress_chars("=>-"))
+        .map_err(|error| anyhow!("failed to configure progress bar: {error}"))
 }
 
 fn load_previous_state(path: &Path) -> Result<StateFile> {
@@ -818,6 +1506,37 @@ fn scale_to_ten(value: u16, source_bit_depth: u8) -> u16 {
     ((u32::from(value).min(source_max) * 1023 + (source_max / 2)) / source_max) as u16
 }
 
+fn scale_to_eight(value: u16, source_bit_depth: u8) -> u8 {
+    let source_bit_depth = source_bit_depth.clamp(1, 16);
+    let source_max = ((1u32 << source_bit_depth) - 1).max(1);
+    ((u32::from(value).min(source_max) * 255 + (source_max / 2)) / source_max) as u8
+}
+
+fn rgb16_to_10_bit_ycbcr(rgb: [u16; 3], matrix: [f32; 3]) -> [u16; 3] {
+    rgb_to_10_bit_ycbcr(rgb, matrix)
+}
+
+fn rgb_to_10_bit_ycbcr(rgb: [u16; 3], matrix: [f32; 3]) -> [u16; 3] {
+    let scale = 1023.0f32;
+    let shift = (scale * 0.5).round();
+    let r = f32::from(rgb[0]);
+    let g = f32::from(rgb[1]);
+    let b = f32::from(rgb[2]);
+    let y = matrix[2].mul_add(b, matrix[0].mul_add(r, matrix[1] * g));
+    let cb = (b - y).mul_add(0.5 / (1.0 - matrix[2]), shift);
+    let cr = (r - y).mul_add(0.5 / (1.0 - matrix[0]), shift);
+
+    [
+        clamp_10_bit(y.round()),
+        clamp_10_bit(cb.round()),
+        clamp_10_bit(cr.round()),
+    ]
+}
+
+fn clamp_10_bit(value: f32) -> u16 {
+    value.clamp(0.0, 1023.0) as u16
+}
+
 fn normalize_relative_path(base_dir: &Path, path: &Path) -> Result<String> {
     let relative = path
         .strip_prefix(base_dir)
@@ -871,12 +1590,20 @@ struct SourceItem {
 struct LoadedImage {
     image: DynamicImage,
     bit_depth: u8,
+    has_alpha: bool,
 }
 
 struct ProcessedPhoto {
     state_key: String,
     state_entry: StateEntry,
     photo_entry: PhotoEntry,
+}
+
+struct ExtractedMetadata {
+    taken_at: Option<String>,
+    location: Option<Location>,
+    camera: Option<Camera>,
+    image: ImageMetadata,
 }
 
 struct LoadedManifest {
@@ -929,6 +1656,8 @@ struct StateFile {
 
 #[derive(Clone, Deserialize, Serialize)]
 struct StateEntry {
+    #[serde(default, rename = "pipelineVersion")]
+    pipeline_version: u16,
     size: u64,
     #[serde(rename = "mtimeMs")]
     mtime_ms: u128,
@@ -943,32 +1672,65 @@ struct StateEntry {
 struct Location {
     lat: f64,
     lng: f64,
-    alt: f64,
-    country: String,
-    city: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alt: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    city: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 struct Camera {
-    make: String,
-    model: String,
-    lens: String,
-    #[serde(rename = "focalLengthMm")]
-    focal_length_mm: u32,
-    #[serde(rename = "focalLengthIn35mm")]
-    focal_length_in_35mm: u32,
-    aperture: f32,
-    shutter: String,
-    iso: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    make: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lens: Option<String>,
+    #[serde(rename = "focalLengthMm", skip_serializing_if = "Option::is_none")]
+    focal_length_mm: Option<f32>,
+    #[serde(rename = "focalLengthIn35mm", skip_serializing_if = "Option::is_none")]
+    focal_length_in_35mm: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aperture: Option<f32>,
+    #[serde(rename = "maxAperture", skip_serializing_if = "Option::is_none")]
+    max_aperture: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shutter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iso: Option<u32>,
+    #[serde(rename = "exposureProgram", skip_serializing_if = "Option::is_none")]
+    exposure_program: Option<String>,
+    #[serde(rename = "exposureMode", skip_serializing_if = "Option::is_none")]
+    exposure_mode: Option<String>,
+    #[serde(rename = "meteringMode", skip_serializing_if = "Option::is_none")]
+    metering_mode: Option<String>,
+    #[serde(rename = "whiteBalance", skip_serializing_if = "Option::is_none")]
+    white_balance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flash: Option<String>,
+    #[serde(rename = "lightSource", skip_serializing_if = "Option::is_none")]
+    light_source: Option<String>,
+    #[serde(rename = "sceneCaptureType", skip_serializing_if = "Option::is_none")]
+    scene_capture_type: Option<String>,
+    #[serde(rename = "brightnessEv", skip_serializing_if = "Option::is_none")]
+    brightness_ev: Option<f32>,
+    #[serde(rename = "sensingMethod", skip_serializing_if = "Option::is_none")]
+    sensing_method: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 struct ImageMetadata {
     orientation: u8,
+    #[serde(rename = "sourceOrientation", skip_serializing_if = "Option::is_none")]
+    source_orientation: Option<u8>,
     #[serde(rename = "colorSpace")]
     color_space: String,
     #[serde(rename = "hasHdr")]
     has_hdr: bool,
     #[serde(rename = "isLivePhoto")]
     is_live_photo: bool,
+    #[serde(rename = "bitDepth", skip_serializing_if = "Option::is_none")]
+    bit_depth: Option<u8>,
 }
