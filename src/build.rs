@@ -11,13 +11,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use blurhash::encode;
 use fast_image_resize as fr;
 use image::{
-    ColorType, DynamicImage, ExtendedColorType, GenericImageView, ImageBuffer, ImageEncoder,
-    ImageFormat, ImageReader, Rgb, Rgba, codecs::avif::AvifEncoder, codecs::jpeg::JpegEncoder,
+    ColorType, DynamicImage, GenericImageView, ImageBuffer, ImageFormat, ImageReader, Rgb, Rgba,
+    codecs::jpeg::JpegEncoder,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 use plist::Value as PlistValue;
+use ravif::{BitDepth as AvifBitDepth, ColorModel as AvifColorModel, Encoder as RavifEncoder, Img};
 use rayon::{ThreadPoolBuilder, prelude::*};
+use rgb::FromSlice;
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::warn;
@@ -29,7 +31,6 @@ const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heif", "h
 const FINDER_TAGS_XATTR: &str = "com.apple.metadata:_kMDItemUserTags";
 const AVIF_EXTENSION: &str = "avif";
 const AVIF_MIME: &str = "image/avif";
-const AVIF_QUALITY: u8 = 82;
 const AVIF_SPEED: u8 = 8;
 
 pub enum BuildExit {
@@ -130,6 +131,7 @@ pub fn run() -> Result<BuildExit> {
                     &root_dir,
                     &originals_dir,
                     &thumbnails_dir,
+                    config.avif_quality,
                     avif_threads,
                     item,
                 );
@@ -356,11 +358,13 @@ fn process_one(
     root_dir: &Path,
     originals_dir: &Path,
     thumbnails_dir: &Path,
+    avif_quality: u8,
     avif_threads: usize,
     item: &SourceItem,
 ) -> Result<ProcessedPhoto> {
-    let image = load_image(&item.path)
+    let loaded = load_image(&item.path)
         .with_context(|| format!("failed to decode {}", item.path.display()))?;
+    let image = &loaded.image;
 
     let thumbnail_path = build_thumbnail_path(thumbnails_dir, config, &item.relative_path);
     if let Some(parent) = thumbnail_path.parent() {
@@ -383,7 +387,7 @@ fn process_one(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    save_original_avif(&image, &original_path, avif_threads)
+    save_original_avif(&loaded, &original_path, avif_quality, avif_threads)
         .with_context(|| format!("failed to write {}", original_path.display()))?;
 
     let original_metadata = fs::metadata(&original_path)
@@ -474,20 +478,25 @@ fn resize_image(image: &DynamicImage, target_width: u32) -> Result<DynamicImage>
     Ok(DynamicImage::ImageRgba8(buffer))
 }
 
-fn load_image(path: &Path) -> Result<DynamicImage> {
+fn load_image(path: &Path) -> Result<LoadedImage> {
     if is_heif_family(path) {
         return decode_heif_image(path);
     }
 
-    ImageReader::open(path)
+    let image = ImageReader::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?
         .with_guessed_format()
         .with_context(|| format!("failed to guess image format for {}", path.display()))?
         .decode()
-        .with_context(|| format!("failed to decode {}", path.display()))
+        .with_context(|| format!("failed to decode {}", path.display()))?;
+
+    Ok(LoadedImage {
+        bit_depth: inferred_bit_depth(&image),
+        image,
+    })
 }
 
-fn decode_heif_image(path: &Path) -> Result<DynamicImage> {
+fn decode_heif_image(path: &Path) -> Result<LoadedImage> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?;
@@ -496,15 +505,70 @@ fn decode_heif_image(path: &Path) -> Result<DynamicImage> {
     let handle = context
         .primary_image_handle()
         .with_context(|| format!("failed to read primary image handle {}", path.display()))?;
+    let bit_depth = handle
+        .luma_bits_per_pixel()
+        .max(handle.chroma_bits_per_pixel());
+    let has_alpha = handle.has_alpha_channel();
+    let hdr = bit_depth > 8;
+    let little_endian = cfg!(target_endian = "little");
+    let color_space = match (hdr, has_alpha, little_endian) {
+        (false, false, _) => ColorSpace::Rgb(RgbChroma::Rgb),
+        (false, true, _) => ColorSpace::Rgb(RgbChroma::Rgba),
+        (true, false, true) => ColorSpace::Rgb(RgbChroma::HdrRgbLe),
+        (true, false, false) => ColorSpace::Rgb(RgbChroma::HdrRgbBe),
+        (true, true, true) => ColorSpace::Rgb(RgbChroma::HdrRgbaLe),
+        (true, true, false) => ColorSpace::Rgb(RgbChroma::HdrRgbaBe),
+    };
     let image = LibHeif::new()
-        .decode(&handle, ColorSpace::Rgb(RgbChroma::Rgb), None)
+        .decode(&handle, color_space, None)
         .with_context(|| format!("failed to decode HEIF image {}", path.display()))?;
     let planes = image.planes();
     let plane = planes
         .interleaved
         .ok_or_else(|| anyhow!("HEIF image is not interleaved: {}", path.display()))?;
 
-    let row_size = plane.width as usize * 3;
+    if hdr {
+        let channels = if has_alpha { 4usize } else { 3usize };
+        let row_size = plane.width as usize * channels * 2;
+        let mut pixels =
+            Vec::with_capacity(plane.width as usize * plane.height as usize * channels);
+
+        for row in plane
+            .data
+            .chunks_exact(plane.stride)
+            .take(plane.height as usize)
+        {
+            for sample in row[..row_size].chunks_exact(2) {
+                let value = if little_endian {
+                    u16::from_le_bytes([sample[0], sample[1]])
+                } else {
+                    u16::from_be_bytes([sample[0], sample[1]])
+                };
+                pixels.push(value);
+            }
+        }
+
+        let image = if has_alpha {
+            let rgba =
+                ImageBuffer::<Rgba<u16>, Vec<u16>>::from_raw(plane.width, plane.height, pixels)
+                    .ok_or_else(|| {
+                        anyhow!("failed to construct HDR RGBA image {}", path.display())
+                    })?;
+            DynamicImage::ImageRgba16(rgba)
+        } else {
+            let rgb =
+                ImageBuffer::<Rgb<u16>, Vec<u16>>::from_raw(plane.width, plane.height, pixels)
+                    .ok_or_else(|| {
+                        anyhow!("failed to construct HDR RGB image {}", path.display())
+                    })?;
+            DynamicImage::ImageRgb16(rgb)
+        };
+
+        return Ok(LoadedImage { image, bit_depth });
+    }
+
+    let channels = if has_alpha { 4usize } else { 3usize };
+    let row_size = plane.width as usize * channels;
     let mut pixels = Vec::with_capacity(row_size * plane.height as usize);
 
     for row in plane
@@ -515,28 +579,78 @@ fn decode_heif_image(path: &Path) -> Result<DynamicImage> {
         pixels.extend_from_slice(&row[..row_size]);
     }
 
-    let rgb = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(plane.width, plane.height, pixels)
-        .ok_or_else(|| anyhow!("failed to construct RGB image buffer {}", path.display()))?;
+    let image = if has_alpha {
+        let rgba = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(plane.width, plane.height, pixels)
+            .ok_or_else(|| anyhow!("failed to construct RGBA image buffer {}", path.display()))?;
+        DynamicImage::ImageRgba8(rgba)
+    } else {
+        let rgb = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(plane.width, plane.height, pixels)
+            .ok_or_else(|| anyhow!("failed to construct RGB image buffer {}", path.display()))?;
+        DynamicImage::ImageRgb8(rgb)
+    };
 
-    Ok(DynamicImage::ImageRgb8(rgb))
+    Ok(LoadedImage {
+        image,
+        bit_depth: 8,
+    })
 }
 
-fn save_original_avif(image: &DynamicImage, path: &Path, avif_threads: usize) -> Result<()> {
-    let rgba = image.to_rgba8();
-    let file =
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-    let writer = BufWriter::new(file);
-    let encoder = AvifEncoder::new_with_speed_quality(writer, AVIF_SPEED, AVIF_QUALITY)
+fn save_original_avif(
+    loaded: &LoadedImage,
+    path: &Path,
+    avif_quality: u8,
+    avif_threads: usize,
+) -> Result<()> {
+    let encoder = RavifEncoder::new()
+        .with_quality(f32::from(avif_quality))
+        .with_alpha_quality(f32::from(avif_quality))
+        .with_speed(AVIF_SPEED)
+        .with_bit_depth(AvifBitDepth::Ten)
+        .with_internal_color_model(AvifColorModel::RGB)
         .with_num_threads(Some(avif_threads));
 
-    encoder
-        .write_image(
-            rgba.as_raw(),
-            rgba.width(),
-            rgba.height(),
-            ExtendedColorType::Rgba8,
-        )
-        .with_context(|| format!("failed to encode AVIF {}", path.display()))?;
+    let avif_file = if loaded.bit_depth > 8 {
+        let rgba = loaded.image.to_rgba16();
+        let width = rgba.width() as usize;
+        let height = rgba.height() as usize;
+        let bit_depth = loaded.bit_depth.min(16).max(10);
+        let has_alpha = rgba.pixels().any(|pixel| pixel.0[3] != u16::MAX);
+        let planes = rgba.pixels().map(|pixel| {
+            [
+                scale_to_ten(pixel.0[1], bit_depth),
+                scale_to_ten(pixel.0[2], bit_depth),
+                scale_to_ten(pixel.0[0], bit_depth),
+            ]
+        });
+
+        encoder
+            .encode_raw_planes_10_bit(
+                width,
+                height,
+                planes,
+                has_alpha.then(|| {
+                    rgba.pixels()
+                        .map(|pixel| scale_to_ten(pixel.0[3], bit_depth))
+                }),
+                ravif::PixelRange::Full,
+                ravif::MatrixCoefficients::Identity,
+            )
+            .map_err(|error| anyhow!("failed to encode 10-bit AVIF: {error}"))?
+            .avif_file
+    } else {
+        let rgba = loaded.image.to_rgba8();
+        let pixels = rgba.as_raw().as_rgba();
+        encoder
+            .encode_rgba(Img::new(
+                pixels,
+                rgba.width() as usize,
+                rgba.height() as usize,
+            ))
+            .map_err(|error| anyhow!("failed to encode AVIF: {error}"))?
+            .avif_file
+    };
+
+    fs::write(path, avif_file).with_context(|| format!("failed to create {}", path.display()))?;
 
     Ok(())
 }
@@ -691,6 +805,19 @@ fn now_rfc3339() -> Result<String> {
     Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
 }
 
+fn inferred_bit_depth(image: &DynamicImage) -> u8 {
+    match image.color() {
+        ColorType::L16 | ColorType::La16 | ColorType::Rgb16 | ColorType::Rgba16 => 16,
+        _ => 8,
+    }
+}
+
+fn scale_to_ten(value: u16, source_bit_depth: u8) -> u16 {
+    let source_bit_depth = source_bit_depth.clamp(1, 16);
+    let source_max = ((1u32 << source_bit_depth) - 1).max(1);
+    ((u32::from(value).min(source_max) * 1023 + (source_max / 2)) / source_max) as u16
+}
+
 fn normalize_relative_path(base_dir: &Path, path: &Path) -> Result<String> {
     let relative = path
         .strip_prefix(base_dir)
@@ -739,6 +866,11 @@ struct SourceItem {
     source_key: String,
     size: u64,
     mtime_ms: u128,
+}
+
+struct LoadedImage {
+    image: DynamicImage,
+    bit_depth: u8,
 }
 
 struct ProcessedPhoto {

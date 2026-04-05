@@ -18,6 +18,8 @@ pub struct Config {
     pub thumbnail_width: u32,
     pub thumbnail_format: ThumbnailFormat,
     pub thumbnail_quality: u8,
+    #[serde(default = "default_avif_quality")]
+    pub avif_quality: u8,
     pub enable_blurhash: bool,
 }
 
@@ -50,6 +52,10 @@ impl Config {
 
         if self.thumbnail_quality == 0 || self.thumbnail_quality > 100 {
             bail!("thumbnail_quality must be between 1 and 100");
+        }
+
+        if self.avif_quality == 0 || self.avif_quality > 100 {
+            bail!("avif_quality must be between 1 and 100");
         }
 
         Ok(())
@@ -110,4 +116,8 @@ fn resolve_from_cwd(path: &PathBuf) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     }
+}
+
+fn default_avif_quality() -> u8 {
+    95
 }
