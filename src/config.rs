@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 const DEFAULT_CONFIG_PATH: &str = "aether.toml";
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     #[serde(rename = "targetPath")]
     pub target_path: PathBuf,
@@ -20,6 +20,8 @@ pub struct Config {
     pub thumbnail_quality: u8,
     #[serde(default = "default_avif_quality")]
     pub avif_quality: u8,
+    #[serde(default = "default_avif_speed")]
+    pub avif_speed: u8,
     pub enable_blurhash: bool,
 }
 
@@ -58,6 +60,10 @@ impl Config {
             bail!("avif_quality must be between 1 and 100");
         }
 
+        if self.avif_speed > 10 {
+            bail!("avif_speed must be between 0 and 10");
+        }
+
         Ok(())
     }
 
@@ -88,12 +94,34 @@ impl Config {
     pub fn state_path(&self) -> PathBuf {
         self.root_dir().join("state.json")
     }
+
+    pub fn fingerprint(&self) -> String {
+        format!(
+            "thumb:{}|fmt:{}|thumbq:{}|avifq:{}|avifs:{}|blur:{}|orig:{}|thumbdir:{}",
+            self.thumbnail_width,
+            self.thumbnail_format.as_str(),
+            self.thumbnail_quality,
+            self.avif_quality,
+            self.avif_speed,
+            self.enable_blurhash,
+            self.originals_dir.to_string_lossy(),
+            self.thumbnails_dir.to_string_lossy(),
+        )
+    }
 }
 
 impl ThumbnailFormat {
     pub fn extension(self) -> &'static str {
         match self {
             Self::Jpeg => "jpg",
+            Self::Png => "png",
+            Self::Webp => "webp",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpeg",
             Self::Png => "png",
             Self::Webp => "webp",
         }
@@ -120,4 +148,8 @@ fn resolve_from_cwd(path: &PathBuf) -> PathBuf {
 
 fn default_avif_quality() -> u8 {
     95
+}
+
+fn default_avif_speed() -> u8 {
+    7
 }
