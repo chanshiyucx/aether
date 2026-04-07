@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     fs,
     fs::File,
-    io::{BufReader, BufWriter, Cursor, Write},
+    io::{BufWriter, Cursor, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -39,7 +39,7 @@ const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heif", "h
 const FINDER_TAGS_XATTR: &str = "com.apple.metadata:_kMDItemUserTags";
 const AVIF_EXTENSION: &str = "avif";
 const AVIF_MIME: &str = "image/avif";
-const PIPELINE_VERSION: u16 = 9;
+const PIPELINE_VERSION: u16 = 10;
 const BT709: [f32; 3] = [0.2126, 0.7152, 0.0722];
 const BLURHASH_LONG_SIDE: u32 = 96;
 const BLURHASH_BLUR_SIGMA: f32 = 2.0;
@@ -459,9 +459,11 @@ fn process_one(
     item: &SourceItem,
 ) -> Result<ProcessedPhoto> {
     let _processing_scope = ScopedCounter::new(&status.processing);
-    let exif = read_exif(&item.path);
+    let source_bytes =
+        fs::read(&item.path).with_context(|| format!("failed to read {}", item.path.display()))?;
+    let exif = read_exif_from_bytes(&item.path, &source_bytes);
     let source_orientation = source_orientation(exif.as_ref());
-    let mut loaded = load_image(&item.path)
+    let mut loaded = load_image_from_bytes(&item.path, &source_bytes)
         .with_context(|| format!("failed to decode {}", item.path.display()))?;
     apply_source_orientation(&mut loaded.image, source_orientation);
     let image = &loaded.image;
@@ -492,7 +494,11 @@ fn process_one(
     }
 
     let preview_image = build_preview_image(&item.path, &loaded, config.thumbnail_width)?;
-    let preview_image = align_preview_orientation(preview_image, image)?;
+    let preview_image = if should_align_preview_orientation(&item.path) {
+        align_preview_orientation(preview_image, image)?
+    } else {
+        preview_image
+    };
     let thumbnail_image = resize_image(&preview_image, config.thumbnail_width)?;
     save_thumbnail(
         &thumbnail_image,
@@ -571,18 +577,8 @@ fn extract_source_metadata(exif: Option<&Exif>, bit_depth: Option<u8>) -> Extrac
     }
 }
 
-fn read_exif(path: &Path) -> Option<Exif> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) => {
-            warn!(
-                "failed to open {} for EXIF extraction: {error}",
-                path.display()
-            );
-            return None;
-        }
-    };
-    let mut reader = BufReader::new(file);
+fn read_exif_from_bytes(path: &Path, bytes: &[u8]) -> Option<Exif> {
+    let mut reader = Cursor::new(bytes);
     let mut exif_reader = ExifReader::new();
     exif_reader.continue_on_error(true);
 
@@ -1013,13 +1009,12 @@ fn resize_to_dimensions(
     Ok(DynamicImage::ImageRgba8(buffer))
 }
 
-fn load_image(path: &Path) -> Result<LoadedImage> {
+fn load_image_from_bytes(path: &Path, bytes: &[u8]) -> Result<LoadedImage> {
     if is_heif_family(path) {
-        return decode_heif_image(path);
+        return decode_heif_image_from_bytes(path, bytes);
     }
 
-    let image = ImageReader::open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?
+    let image = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .with_context(|| format!("failed to guess image format for {}", path.display()))?
         .decode()
@@ -1032,11 +1027,8 @@ fn load_image(path: &Path) -> Result<LoadedImage> {
     })
 }
 
-fn decode_heif_image(path: &Path) -> Result<LoadedImage> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?;
-    let context = HeifContext::read_from_file(path_str)
+fn decode_heif_image_from_bytes(path: &Path, bytes: &[u8]) -> Result<LoadedImage> {
+    let context = HeifContext::read_from_bytes(bytes)
         .with_context(|| format!("failed to open HEIF container {}", path.display()))?;
     let handle = context
         .primary_image_handle()
@@ -1300,6 +1292,10 @@ fn build_preview_image(
     build_preview_image_fallback(loaded)
 }
 
+fn should_align_preview_orientation(source_path: &Path) -> bool {
+    !is_heif_family(source_path)
+}
+
 fn align_preview_orientation(
     preview_image: DynamicImage,
     reference_image: &DynamicImage,
@@ -1443,7 +1439,7 @@ fn build_preview_image_fallback(loaded: &LoadedImage) -> Result<DynamicImage> {
             pixel
                 .0
                 .iter()
-                .map(|component| scale_to_eight(*component, source_bit_depth))
+                .map(|component| preview_scale_to_eight(*component, source_bit_depth))
         })
         .collect::<Vec<_>>();
 
@@ -1466,7 +1462,11 @@ fn build_preview_image_with_heif_convert(
     source_path: &Path,
     target_width: u32,
 ) -> Result<DynamicImage> {
-    let converted_path = temporary_preview_path("png");
+    let temp_dir = tempfile::Builder::new()
+        .prefix("aether-preview-")
+        .tempdir()
+        .context("failed to create temporary preview directory")?;
+    let converted_path = temp_dir.path().join("converted.png");
     let convert_output = Command::new("heif-convert")
         .arg("--quiet")
         .arg("--png-compression-level")
@@ -1482,7 +1482,6 @@ fn build_preview_image_with_heif_convert(
         })?;
 
     if !convert_output.status.success() {
-        let _ = fs::remove_file(&converted_path);
         let stderr = String::from_utf8_lossy(&convert_output.stderr)
             .trim()
             .to_string();
@@ -1495,16 +1494,18 @@ fn build_preview_image_with_heif_convert(
         );
     }
 
-    let result = build_preview_image_with_sips_from_path(&converted_path, target_width);
-    let _ = fs::remove_file(&converted_path);
-    result
+    build_preview_image_with_sips_from_path(&converted_path, target_width)
 }
 
 fn build_preview_image_with_sips_from_path(
     source_path: &Path,
     target_width: u32,
 ) -> Result<DynamicImage> {
-    let preview_path = temporary_preview_path("png");
+    let temp_dir = tempfile::Builder::new()
+        .prefix("aether-preview-")
+        .tempdir()
+        .context("failed to create temporary preview directory")?;
+    let preview_path = temp_dir.path().join("preview.png");
     let output = Command::new("sips")
         .arg("--optimizeColorForSharing")
         .arg("--resampleWidth")
@@ -1518,7 +1519,7 @@ fn build_preview_image_with_sips_from_path(
         .output()
         .with_context(|| format!("failed to launch sips for {}", source_path.display()))?;
 
-    let result = (|| {
+    (|| {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
@@ -1538,21 +1539,7 @@ fn build_preview_image_with_sips_from_path(
             })?
             .decode()
             .with_context(|| format!("failed to decode preview {}", preview_path.display()))
-    })();
-
-    let _ = fs::remove_file(&preview_path);
-    result
-}
-
-fn temporary_preview_path(extension: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let mut filename = OsString::from(format!("aether-preview-{}-{nanos}", std::process::id()));
-    filename.push(".");
-    filename.push(extension);
-    std::env::temp_dir().join(filename)
+    })()
 }
 
 fn source_orientation(exif: Option<&Exif>) -> u8 {
@@ -1828,10 +1815,12 @@ fn scale_to_ten(value: u16, source_bit_depth: u8) -> u16 {
     ((u32::from(value).min(source_max) * 1023 + (source_max / 2)) / source_max) as u16
 }
 
-fn scale_to_eight(value: u16, source_bit_depth: u8) -> u8 {
+fn preview_scale_to_eight(value: u16, source_bit_depth: u8) -> u8 {
     let source_bit_depth = source_bit_depth.clamp(1, 16);
-    let source_max = ((1u32 << source_bit_depth) - 1).max(1);
-    ((u32::from(value).min(source_max) * 255 + (source_max / 2)) / source_max) as u8
+    let source_max = ((1u32 << source_bit_depth) - 1).max(1) as f32;
+    let normalized = (f32::from(value.min(source_max as u16)) / source_max).clamp(0.0, 1.0);
+    let gamma_mapped = normalized.powf(1.0 / 2.2);
+    (gamma_mapped * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 fn rgb16_to_10_bit_ycbcr(rgb: [u16; 3], matrix: [f32; 3]) -> [u16; 3] {
