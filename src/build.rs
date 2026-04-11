@@ -43,7 +43,7 @@ const BLURHASH_LONG_SIDE: u32 = 64;
 const BLURHASH_BLUR_SIGMA: f32 = 4.0;
 const BLURHASH_EDGE_CROP_RATIO: f32 = 0.035;
 const PREVIEW_ORIENTATION_COMPARE_SIZE: u32 = 64;
-const CHECKPOINT_BATCH: usize = 8;
+const CHECKPOINT_BATCH_MIN: usize = 8;
 
 pub enum BuildExit {
     Success,
@@ -86,9 +86,10 @@ pub fn run() -> Result<BuildExit> {
     sources.sort_by(|left, right| left.source_key.cmp(&right.source_key));
 
     let total = sources.len();
+    let checkpoint_batch = CHECKPOINT_BATCH_MIN.max(total / 50);
     let parallelism = recommended_parallelism();
     let avif_threads = recommended_avif_threads(parallelism, total);
-    let avif_parallelism = recommended_avif_parallelism(parallelism);
+    let full_res_parallelism = recommended_full_res_parallelism(parallelism);
 
     println!("starting build");
     println!("root: {}", root_dir.display());
@@ -152,14 +153,14 @@ pub fn run() -> Result<BuildExit> {
     let worker_root_dir = root_dir.clone();
     let worker_originals_dir = originals_dir.clone();
     let worker_thumbnails_dir = thumbnails_dir.clone();
-    let avif_limiter = Arc::new(EncodeLimiter::new(avif_parallelism));
+    let full_res_limiter = Arc::new(FullResLimiter::new(full_res_parallelism));
     let pending_queue = Arc::new(Mutex::new(VecDeque::from(pending)));
     let status_observer = Arc::clone(&status);
     let worker_status = Arc::clone(&status);
     let status_progress = progress.clone();
     let status_done_flag = Arc::clone(&status_done);
     let status_thread = std::thread::spawn(move || {
-        while !status_done_flag.load(Ordering::Relaxed) {
+        while !status_done_flag.load(Ordering::Acquire) {
             let processing = status_observer.processing.load(Ordering::Relaxed);
             let encoding = status_observer.encoding.load(Ordering::Relaxed);
             status_progress.set_message(format!("building ({processing} active, {encoding} avif)"));
@@ -173,7 +174,7 @@ pub fn run() -> Result<BuildExit> {
             let root_dir = worker_root_dir.clone();
             let originals_dir = worker_originals_dir.clone();
             let thumbnails_dir = worker_thumbnails_dir.clone();
-            let avif_limiter = Arc::clone(&avif_limiter);
+            let full_res_limiter = Arc::clone(&full_res_limiter);
             let status = Arc::clone(&worker_status);
             let pending_queue = Arc::clone(&pending_queue);
 
@@ -194,7 +195,7 @@ pub fn run() -> Result<BuildExit> {
                         originals_dir: &originals_dir,
                         thumbnails_dir: &thumbnails_dir,
                         avif_threads,
-                        avif_limiter: &avif_limiter,
+                        full_res_limiter: &full_res_limiter,
                         status: &status,
                     };
                     let result = process_one(&context, &item);
@@ -234,7 +235,7 @@ pub fn run() -> Result<BuildExit> {
                 );
                 built_count += 1;
                 since_checkpoint += 1;
-                if built_count == 1 || since_checkpoint >= CHECKPOINT_BATCH {
+                if built_count == 1 || since_checkpoint >= checkpoint_batch {
                     checkpoint_outputs(&config, &photos, &files)?;
                     since_checkpoint = 0;
                 }
@@ -251,7 +252,7 @@ pub fn run() -> Result<BuildExit> {
             .join()
             .map_err(|_| anyhow!("build worker thread panicked"))?;
     }
-    status_done.store(true, Ordering::Relaxed);
+    status_done.store(true, Ordering::Release);
     let _ = status_thread.join();
 
     let failed_count = failures.len();
@@ -436,7 +437,7 @@ fn process_one(context: &ProcessContext<'_>, item: &SourceItem) -> Result<Proces
     let root_dir = context.root_dir;
     let originals_dir = context.originals_dir;
     let thumbnails_dir = context.thumbnails_dir;
-    let avif_limiter = context.avif_limiter;
+    let full_res_limiter = context.full_res_limiter;
     let status = context.status;
     let exif = read_exif(&item.path);
     let source_orientation = source_orientation(exif.as_ref());
@@ -454,7 +455,7 @@ fn process_one(context: &ProcessContext<'_>, item: &SourceItem) -> Result<Proces
     }
 
     let (original_width, original_height, source_bit_depth, orientation_reference) = {
-        let avif_slot = avif_limiter.acquire();
+        let full_res_slot = full_res_limiter.acquire();
         let _processing_scope = ScopedCounter::new(&status.processing);
         let source_bytes = fs::read(&item.path)
             .with_context(|| format!("failed to read {}", item.path.display()))?;
@@ -483,7 +484,7 @@ fn process_one(context: &ProcessContext<'_>, item: &SourceItem) -> Result<Proces
             .with_context(|| format!("failed to write {}", original_path.display()))?;
         }
         drop(loaded);
-        drop(avif_slot);
+        drop(full_res_slot);
 
         (
             original_width,
@@ -1189,7 +1190,7 @@ fn save_original_avif(
             let width = rgba.width() as usize;
             let height = rgba.height() as usize;
             let planes = rgba.pixels().map(|pixel| {
-                rgb16_to_10_bit_ycbcr(
+                rgb_to_10_bit_ycbcr(
                     [
                         scale_to_ten(pixel.0[0], bit_depth),
                         scale_to_ten(pixel.0[1], bit_depth),
@@ -1218,7 +1219,7 @@ fn save_original_avif(
             let width = rgb.width() as usize;
             let height = rgb.height() as usize;
             let planes = rgb.pixels().map(|pixel| {
-                rgb16_to_10_bit_ycbcr(
+                rgb_to_10_bit_ycbcr(
                     [
                         scale_to_ten(pixel.0[0], bit_depth),
                         scale_to_ten(pixel.0[1], bit_depth),
@@ -1434,6 +1435,10 @@ fn best_orientation_transform(
             reference.canvas_width,
             reference.canvas_height,
         )?;
+        if score == 0 {
+            return Ok(transform);
+        }
+
         let replace = match best {
             Some((best_score, _)) => score < best_score,
             None => true,
@@ -1745,7 +1750,7 @@ fn recommended_avif_threads(worker_count: usize, total_jobs: usize) -> usize {
     }
 }
 
-fn recommended_avif_parallelism(worker_count: usize) -> usize {
+fn recommended_full_res_parallelism(worker_count: usize) -> usize {
     match worker_count {
         0 | 1 => 1,
         2 | 3 => 1,
@@ -1778,13 +1783,13 @@ impl Drop for ScopedCounter<'_> {
     }
 }
 
-struct EncodeLimiter {
+struct FullResLimiter {
     active: Mutex<usize>,
     wake: Condvar,
     limit: usize,
 }
 
-impl EncodeLimiter {
+impl FullResLimiter {
     fn new(limit: usize) -> Self {
         Self {
             active: Mutex::new(0),
@@ -1793,26 +1798,30 @@ impl EncodeLimiter {
         }
     }
 
-    fn acquire(&self) -> EncodePermit<'_> {
-        let mut active = self.active.lock().expect("encode limiter poisoned");
+    fn acquire(&self) -> FullResPermit<'_> {
+        let mut active = self.active.lock().expect("full-res limiter poisoned");
         while *active >= self.limit {
             active = self
                 .wake
                 .wait(active)
-                .expect("encode limiter wait poisoned");
+                .expect("full-res limiter wait poisoned");
         }
         *active += 1;
-        EncodePermit { limiter: self }
+        FullResPermit { limiter: self }
     }
 }
 
-struct EncodePermit<'a> {
-    limiter: &'a EncodeLimiter,
+struct FullResPermit<'a> {
+    limiter: &'a FullResLimiter,
 }
 
-impl Drop for EncodePermit<'_> {
+impl Drop for FullResPermit<'_> {
     fn drop(&mut self) {
-        let mut active = self.limiter.active.lock().expect("encode limiter poisoned");
+        let mut active = self
+            .limiter
+            .active
+            .lock()
+            .expect("full-res limiter poisoned");
         *active = active.saturating_sub(1);
         self.limiter.wake.notify_one();
     }
@@ -1945,10 +1954,6 @@ fn preview_scale_to_eight(value: u16, source_bit_depth: u8) -> u8 {
     (gamma_mapped * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-fn rgb16_to_10_bit_ycbcr(rgb: [u16; 3], matrix: [f32; 3]) -> [u16; 3] {
-    rgb_to_10_bit_ycbcr(rgb, matrix)
-}
-
 fn rgb_to_10_bit_ycbcr(rgb: [u16; 3], matrix: [f32; 3]) -> [u16; 3] {
     let scale = 1023.0f32;
     let shift = (scale * 0.5).round();
@@ -2032,7 +2037,7 @@ struct ProcessContext<'a> {
     originals_dir: &'a Path,
     thumbnails_dir: &'a Path,
     avif_threads: usize,
-    avif_limiter: &'a Arc<EncodeLimiter>,
+    full_res_limiter: &'a Arc<FullResLimiter>,
     status: &'a Arc<BuildStatus>,
 }
 
