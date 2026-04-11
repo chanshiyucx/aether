@@ -94,34 +94,12 @@ impl Config {
     pub fn state_path(&self) -> PathBuf {
         self.root_dir().join("state.json")
     }
-
-    pub fn fingerprint(&self) -> String {
-        format!(
-            "thumb:{}|fmt:{}|thumbq:{}|avifq:{}|avifs:{}|blur:{}|orig:{}|thumbdir:{}",
-            self.thumbnail_width,
-            self.thumbnail_format.as_str(),
-            self.thumbnail_quality,
-            self.avif_quality,
-            self.avif_speed,
-            self.enable_blurhash,
-            self.originals_dir.to_string_lossy(),
-            self.thumbnails_dir.to_string_lossy(),
-        )
-    }
 }
 
 impl ThumbnailFormat {
     pub fn extension(self) -> &'static str {
         match self {
             Self::Jpeg => "jpg",
-            Self::Png => "png",
-            Self::Webp => "webp",
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Jpeg => "jpeg",
             Self::Png => "png",
             Self::Webp => "webp",
         }

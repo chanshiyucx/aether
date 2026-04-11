@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    ffi::OsString,
     fs,
     fs::File,
     io::{BufWriter, Cursor, Write},
@@ -39,10 +38,10 @@ const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heif", "h
 const FINDER_TAGS_XATTR: &str = "com.apple.metadata:_kMDItemUserTags";
 const AVIF_EXTENSION: &str = "avif";
 const AVIF_MIME: &str = "image/avif";
-const PIPELINE_VERSION: u16 = 10;
 const BT709: [f32; 3] = [0.2126, 0.7152, 0.0722];
-const BLURHASH_LONG_SIDE: u32 = 96;
-const BLURHASH_BLUR_SIGMA: f32 = 2.0;
+const BLURHASH_LONG_SIDE: u32 = 64;
+const BLURHASH_BLUR_SIGMA: f32 = 4.0;
+const BLURHASH_EDGE_CROP_RATIO: f32 = 0.035;
 const PREVIEW_ORIENTATION_COMPARE_SIZE: u32 = 64;
 const CHECKPOINT_BATCH: usize = 8;
 
@@ -83,7 +82,6 @@ pub fn run() -> Result<BuildExit> {
 
     let previous_manifest = load_previous_manifest(&config.manifest_path())?;
     let previous_state = load_previous_state(&config.state_path())?;
-    let config_fingerprint = config.fingerprint();
     let mut sources = collect_selected_sources(&source_dir, config.source_tags())?;
     sources.sort_by(|left, right| left.source_key.cmp(&right.source_key));
 
@@ -115,21 +113,17 @@ pub fn run() -> Result<BuildExit> {
     let current_keys: BTreeSet<_> = sources.iter().map(|item| item.source_key.clone()).collect();
     cleanup_removed_outputs(&root_dir, &current_keys, &previous_state)?;
 
-    let mut photos = Vec::new();
+    let mut photos = BTreeMap::new();
     let mut files = BTreeMap::new();
     let mut pending = Vec::new();
     let mut reused_count = 0usize;
 
     for item in sources {
-        if let Some((photo, state_entry)) = try_reuse(
-            &root_dir,
-            &item,
-            &previous_manifest,
-            &previous_state,
-            &config_fingerprint,
-        ) {
+        if let Some((photo, state_entry)) =
+            try_reuse(&root_dir, &item, &previous_manifest, &previous_state)
+        {
             progress.inc(1);
-            photos.push(photo);
+            photos.insert(photo.original.url.clone(), photo);
             files.insert(item.source_key, state_entry);
             reused_count += 1;
         } else {
@@ -137,8 +131,9 @@ pub fn run() -> Result<BuildExit> {
         }
     }
     pending.sort_by(|left, right| {
-        left.size
-            .cmp(&right.size)
+        right
+            .size
+            .cmp(&left.size)
             .then_with(|| left.source_key.cmp(&right.source_key))
     });
 
@@ -157,7 +152,6 @@ pub fn run() -> Result<BuildExit> {
     let worker_root_dir = root_dir.clone();
     let worker_originals_dir = originals_dir.clone();
     let worker_thumbnails_dir = thumbnails_dir.clone();
-    let worker_config_fingerprint = config_fingerprint.clone();
     let avif_limiter = Arc::new(EncodeLimiter::new(avif_parallelism));
     let pending_queue = Arc::new(Mutex::new(VecDeque::from(pending)));
     let status_observer = Arc::clone(&status);
@@ -179,7 +173,6 @@ pub fn run() -> Result<BuildExit> {
             let root_dir = worker_root_dir.clone();
             let originals_dir = worker_originals_dir.clone();
             let thumbnails_dir = worker_thumbnails_dir.clone();
-            let config_fingerprint = worker_config_fingerprint.clone();
             let avif_limiter = Arc::clone(&avif_limiter);
             let status = Arc::clone(&worker_status);
             let pending_queue = Arc::clone(&pending_queue);
@@ -195,26 +188,23 @@ pub fn run() -> Result<BuildExit> {
                         break;
                     };
 
-                    let result = process_one(
-                        &config,
-                        &root_dir,
-                        &originals_dir,
-                        &thumbnails_dir,
-                        config.avif_quality,
-                        config.avif_speed,
+                    let context = ProcessContext {
+                        config: &config,
+                        root_dir: &root_dir,
+                        originals_dir: &originals_dir,
+                        thumbnails_dir: &thumbnails_dir,
                         avif_threads,
-                        &avif_limiter,
-                        &config_fingerprint,
-                        &status,
-                        &item,
-                    );
+                        avif_limiter: &avif_limiter,
+                        status: &status,
+                    };
+                    let result = process_one(&context, &item);
 
                     if let Err(error) = &result {
                         warn!("skipped {}: {error:#}", item.path.display());
                     }
 
                     let outcome = match result {
-                        Ok(processed) => BuildOutcome::Success(processed),
+                        Ok(processed) => BuildOutcome::Success(Box::new(processed)),
                         Err(error) => BuildOutcome::Failure {
                             source_key: item.source_key.clone(),
                             error: format!("{error:#}"),
@@ -236,8 +226,12 @@ pub fn run() -> Result<BuildExit> {
 
         match outcome {
             BuildOutcome::Success(processed) => {
+                let processed = *processed;
                 files.insert(processed.state_key, processed.state_entry);
-                photos.push(processed.photo_entry);
+                photos.insert(
+                    processed.photo_entry.original.url.clone(),
+                    processed.photo_entry,
+                );
                 built_count += 1;
                 since_checkpoint += 1;
                 if built_count == 1 || since_checkpoint >= CHECKPOINT_BATCH {
@@ -259,8 +253,6 @@ pub fn run() -> Result<BuildExit> {
     }
     status_done.store(true, Ordering::Relaxed);
     let _ = status_thread.join();
-
-    photos.sort_by(|left, right| left.original.url.cmp(&right.original.url));
 
     let failed_count = failures.len();
     checkpoint_outputs(&config, &photos, &files)?;
@@ -380,22 +372,11 @@ fn try_reuse(
     item: &SourceItem,
     previous_manifest: &LoadedManifest,
     previous_state: &StateFile,
-    config_fingerprint: &str,
 ) -> Option<(PhotoEntry, StateEntry)> {
     let state_entry = previous_state.files.get(&item.source_key)?;
     if state_entry.original.is_empty() {
         return None;
     }
-
-    if state_entry.pipeline_version != PIPELINE_VERSION {
-        return None;
-    }
-
-    if state_entry.config_fingerprint != config_fingerprint {
-        return None;
-    }
-
-    let photo_entry = previous_manifest.photos_by_key.get(&state_entry.original)?;
 
     if state_entry.size != item.size || state_entry.mtime_ms != item.mtime_ms {
         return None;
@@ -411,7 +392,12 @@ fn try_reuse(
         return None;
     }
 
-    Some((photo_entry.clone(), state_entry.clone()))
+    let photo_entry = previous_manifest
+        .photos_by_key
+        .get(&state_entry.original)?
+        .clone();
+
+    Some((photo_entry, state_entry.clone()))
 }
 
 fn cleanup_removed_outputs(
@@ -445,46 +431,20 @@ fn remove_output_if_exists(root_dir: &Path, relative_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn process_one(
-    config: &Config,
-    root_dir: &Path,
-    originals_dir: &Path,
-    thumbnails_dir: &Path,
-    avif_quality: u8,
-    avif_speed: u8,
-    avif_threads: usize,
-    avif_limiter: &Arc<EncodeLimiter>,
-    config_fingerprint: &str,
-    status: &Arc<BuildStatus>,
-    item: &SourceItem,
-) -> Result<ProcessedPhoto> {
-    let _processing_scope = ScopedCounter::new(&status.processing);
-    let source_bytes =
-        fs::read(&item.path).with_context(|| format!("failed to read {}", item.path.display()))?;
-    let exif = read_exif_from_bytes(&item.path, &source_bytes);
+fn process_one(context: &ProcessContext<'_>, item: &SourceItem) -> Result<ProcessedPhoto> {
+    let config = context.config;
+    let root_dir = context.root_dir;
+    let originals_dir = context.originals_dir;
+    let thumbnails_dir = context.thumbnails_dir;
+    let avif_limiter = context.avif_limiter;
+    let status = context.status;
+    let exif = read_exif(&item.path);
     let source_orientation = source_orientation(exif.as_ref());
-    let mut loaded = load_image_from_bytes(&item.path, &source_bytes)
-        .with_context(|| format!("failed to decode {}", item.path.display()))?;
-    apply_source_orientation(&mut loaded.image, source_orientation);
-    let image = &loaded.image;
 
     let original_path = build_original_path(originals_dir, &item.relative_path);
     if let Some(parent) = original_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    {
-        let _avif_slot = avif_limiter.acquire();
-        let _encoding_scope = ScopedCounter::new(&status.encoding);
-        save_original_avif(
-            &loaded,
-            &original_path,
-            avif_quality,
-            avif_speed,
-            avif_threads,
-        )
-        .with_context(|| format!("failed to write {}", original_path.display()))?;
     }
 
     let thumbnail_path = build_thumbnail_path(thumbnails_dir, config, &item.relative_path);
@@ -493,32 +453,79 @@ fn process_one(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let preview_image = build_preview_image(&item.path, &loaded, config.thumbnail_width)?;
-    let preview_image = if should_align_preview_orientation(&item.path) {
-        align_preview_orientation(preview_image, image)?
-    } else {
-        preview_image
+    let (original_width, original_height, source_bit_depth, orientation_reference) = {
+        let avif_slot = avif_limiter.acquire();
+        let _processing_scope = ScopedCounter::new(&status.processing);
+        let source_bytes = fs::read(&item.path)
+            .with_context(|| format!("failed to read {}", item.path.display()))?;
+        let mut loaded = load_image_from_bytes(&item.path, &source_bytes)
+            .with_context(|| format!("failed to decode {}", item.path.display()))?;
+        drop(source_bytes);
+
+        apply_source_orientation(&mut loaded.image, source_orientation);
+        let (original_width, original_height) = loaded.image.dimensions();
+        let source_bit_depth = loaded.bit_depth;
+        let orientation_reference = if should_align_preview_orientation(&item.path) {
+            Some(build_orientation_reference(&loaded.image)?)
+        } else {
+            None
+        };
+
+        {
+            let _encoding_scope = ScopedCounter::new(&status.encoding);
+            save_original_avif(
+                &loaded,
+                &original_path,
+                config.avif_quality,
+                config.avif_speed,
+                context.avif_threads,
+            )
+            .with_context(|| format!("failed to write {}", original_path.display()))?;
+        }
+        drop(loaded);
+        drop(avif_slot);
+
+        (
+            original_width,
+            original_height,
+            source_bit_depth,
+            orientation_reference,
+        )
     };
-    let thumbnail_image = resize_image(&preview_image, config.thumbnail_width)?;
-    save_thumbnail(
-        &thumbnail_image,
-        &thumbnail_path,
-        config.thumbnail_format,
-        config.thumbnail_quality,
-    )
-    .with_context(|| format!("failed to write {}", thumbnail_path.display()))?;
+
+    let thumbnail_image = {
+        let _processing_scope = ScopedCounter::new(&status.processing);
+        let preview_width = original_width.min(config.thumbnail_width).max(1);
+        let preview_image = build_preview_image(&item.path, preview_width, source_orientation)?;
+        let preview_image = if let Some(reference) = orientation_reference.as_ref() {
+            align_preview_orientation(preview_image, reference)?
+        } else {
+            preview_image
+        };
+        let thumbnail_image = resize_image(&preview_image, config.thumbnail_width)?;
+        save_thumbnail(
+            &thumbnail_image,
+            &thumbnail_path,
+            config.thumbnail_format,
+            config.thumbnail_quality,
+        )
+        .with_context(|| format!("failed to write {}", thumbnail_path.display()))?;
+        thumbnail_image
+    };
 
     let original_metadata = fs::metadata(&original_path)
         .with_context(|| format!("failed to read metadata for {}", original_path.display()))?;
     let thumbnail_metadata = fs::metadata(&thumbnail_path)
         .with_context(|| format!("failed to read metadata for {}", thumbnail_path.display()))?;
-    let (original_width, original_height) = image.dimensions();
     let (thumbnail_width, thumbnail_height) = thumbnail_image.dimensions();
 
-    let blurhash = if config.enable_blurhash {
-        Some(compute_blurhash(&thumbnail_image)?)
-    } else {
-        None
+    let blurhash = {
+        let _processing_scope = ScopedCounter::new(&status.processing);
+        if config.enable_blurhash {
+            Some(compute_blurhash(&thumbnail_image)?)
+        } else {
+            None
+        }
     };
 
     let original_key = normalize_relative_path(root_dir, &original_path)?;
@@ -528,13 +535,12 @@ fn process_one(
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .ok_or_else(|| anyhow!("missing file stem for {}", item.path.display()))?;
-    let extracted = extract_source_metadata(exif.as_ref(), Some(loaded.bit_depth));
+    let extracted =
+        extract_source_metadata(exif.as_ref(), Some(source_bit_depth), source_orientation);
 
     Ok(ProcessedPhoto {
         state_key: item.source_key.clone(),
         state_entry: StateEntry {
-            pipeline_version: PIPELINE_VERSION,
-            config_fingerprint: config_fingerprint.to_string(),
             size: item.size,
             mtime_ms: item.mtime_ms,
             original: original_key.clone(),
@@ -566,9 +572,11 @@ fn process_one(
     })
 }
 
-fn extract_source_metadata(exif: Option<&Exif>, bit_depth: Option<u8>) -> ExtractedMetadata {
-    let source_orientation = source_orientation(exif);
-
+fn extract_source_metadata(
+    exif: Option<&Exif>,
+    bit_depth: Option<u8>,
+    source_orientation: u8,
+) -> ExtractedMetadata {
     ExtractedMetadata {
         taken_at: exif.and_then(extract_taken_at),
         location: exif.and_then(extract_location),
@@ -577,8 +585,15 @@ fn extract_source_metadata(exif: Option<&Exif>, bit_depth: Option<u8>) -> Extrac
     }
 }
 
-fn read_exif_from_bytes(path: &Path, bytes: &[u8]) -> Option<Exif> {
-    let mut reader = Cursor::new(bytes);
+fn read_exif(path: &Path) -> Option<Exif> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            warn!("failed to open EXIF source {}: {error}", path.display());
+            return None;
+        }
+    };
+    let mut reader = std::io::BufReader::new(file);
     let mut exif_reader = ExifReader::new();
     exif_reader.continue_on_error(true);
 
@@ -624,16 +639,16 @@ fn extract_taken_at(exif: &Exif) -> Option<String> {
 
     let mut datetime = ExifDateTime::from_ascii(exif_ascii(exif, date_tag)?).ok()?;
 
-    if let Some(tag) = subsec_tag {
-        if let Some(value) = exif_ascii(exif, tag) {
-            let _ = datetime.parse_subsec(value);
-        }
+    if let Some(tag) = subsec_tag
+        && let Some(value) = exif_ascii(exif, tag)
+    {
+        let _ = datetime.parse_subsec(value);
     }
 
-    if let Some(tag) = offset_tag {
-        if let Some(value) = exif_ascii(exif, tag) {
-            let _ = datetime.parse_offset(value);
-        }
+    if let Some(tag) = offset_tag
+        && let Some(value) = exif_ascii(exif, tag)
+    {
+        let _ = datetime.parse_offset(value);
     }
 
     Some(format_exif_datetime(&datetime))
@@ -666,14 +681,12 @@ fn extract_camera(exif: &Exif) -> Option<Camera> {
     let model = exif_text(exif, Tag::Model);
     let lens = exif_text(exif, Tag::LensModel).or_else(|| exif_text(exif, Tag::LensMake));
     let focal_length_mm = rational_value(exif, Tag::FocalLength).map(round_f32);
-    let focal_length_in_35mm =
-        exif_uint(exif, Tag::FocalLengthIn35mmFilm).map(|value| value as u32);
+    let focal_length_in_35mm = exif_uint(exif, Tag::FocalLengthIn35mmFilm);
     let aperture = rational_value(exif, Tag::FNumber).map(round_f32);
     let max_aperture = extract_max_aperture(exif);
     let shutter = exif_display(exif, Tag::ExposureTime);
-    let iso = exif_uint(exif, Tag::PhotographicSensitivity)
-        .or_else(|| exif_uint(exif, Tag::ISOSpeed))
-        .map(|value| value as u32);
+    let iso =
+        exif_uint(exif, Tag::PhotographicSensitivity).or_else(|| exif_uint(exif, Tag::ISOSpeed));
     let exposure_program = exif_display(exif, Tag::ExposureProgram);
     let exposure_mode = compact_exposure_mode(exif);
     let metering_mode = exif_display(exif, Tag::MeteringMode);
@@ -749,7 +762,7 @@ fn extract_image_metadata(
     }
 }
 
-fn exif_ascii<'a>(exif: &'a Exif, tag: Tag) -> Option<&'a [u8]> {
+fn exif_ascii(exif: &Exif, tag: Tag) -> Option<&[u8]> {
     match &exif.get_field(tag, In::PRIMARY)?.value {
         Value::Ascii(values) => values.first().map(|value| value.as_slice()),
         _ => None,
@@ -985,28 +998,54 @@ fn resize_to_dimensions(
     target_width: u32,
     target_height: u32,
 ) -> Result<DynamicImage> {
-    let src = image.to_rgba8();
-    let src_width = src.width();
-    let src_height = src.height();
-    let src_image =
-        fr::images::Image::from_vec_u8(src_width, src_height, src.into_raw(), fr::PixelType::U8x4)
-            .map_err(|error| anyhow!("failed to create resize source buffer: {error}"))?;
-    let mut dst_image = fr::images::Image::new(target_width, target_height, fr::PixelType::U8x4);
     let options =
         fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3));
     let mut resizer = fr::Resizer::new();
+
+    if image.has_alpha() {
+        let src = image.to_rgba8();
+        let src_width = src.width();
+        let src_height = src.height();
+        let src_image = fr::images::Image::from_vec_u8(
+            src_width,
+            src_height,
+            src.into_raw(),
+            fr::PixelType::U8x4,
+        )
+        .map_err(|error| anyhow!("failed to create resize source buffer: {error}"))?;
+        let mut dst_image =
+            fr::images::Image::new(target_width, target_height, fr::PixelType::U8x4);
+        resizer
+            .resize(&src_image, &mut dst_image, Some(&options))
+            .map_err(|error| anyhow!("failed to resize image: {error}"))?;
+        let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
+            target_width,
+            target_height,
+            dst_image.into_vec(),
+        )
+        .ok_or_else(|| anyhow!("failed to build resized RGBA image buffer"))?;
+
+        return Ok(DynamicImage::ImageRgba8(buffer));
+    }
+
+    let src = image.to_rgb8();
+    let src_width = src.width();
+    let src_height = src.height();
+    let src_image =
+        fr::images::Image::from_vec_u8(src_width, src_height, src.into_raw(), fr::PixelType::U8x3)
+            .map_err(|error| anyhow!("failed to create resize source buffer: {error}"))?;
+    let mut dst_image = fr::images::Image::new(target_width, target_height, fr::PixelType::U8x3);
     resizer
         .resize(&src_image, &mut dst_image, Some(&options))
         .map_err(|error| anyhow!("failed to resize image: {error}"))?;
-
-    let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
+    let buffer = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(
         target_width,
         target_height,
         dst_image.into_vec(),
     )
-    .ok_or_else(|| anyhow!("failed to build resized RGBA image buffer"))?;
+    .ok_or_else(|| anyhow!("failed to build resized RGB image buffer"))?;
 
-    Ok(DynamicImage::ImageRgba8(buffer))
+    Ok(DynamicImage::ImageRgb8(buffer))
 }
 
 fn load_image_from_bytes(path: &Path, bytes: &[u8]) -> Result<LoadedImage> {
@@ -1143,35 +1182,64 @@ fn save_original_avif(
             .with_bit_depth(AvifBitDepth::Ten)
             .with_internal_color_model(AvifColorModel::YCbCr)
             .with_num_threads(Some(avif_threads));
-        let rgba = loaded.image.to_rgba16();
-        let width = rgba.width() as usize;
-        let height = rgba.height() as usize;
-        let bit_depth = loaded.bit_depth.min(16).max(10);
-        let planes = rgba.pixels().map(|pixel| {
-            rgb16_to_10_bit_ycbcr(
-                [
-                    scale_to_ten(pixel.0[0], bit_depth),
-                    scale_to_ten(pixel.0[1], bit_depth),
-                    scale_to_ten(pixel.0[2], bit_depth),
-                ],
-                BT709,
-            )
-        });
+        let bit_depth = loaded.bit_depth.clamp(10, 16);
 
-        encoder
-            .encode_raw_planes_10_bit(
-                width,
-                height,
-                planes,
-                loaded.has_alpha.then(|| {
-                    rgba.pixels()
-                        .map(|pixel| scale_to_ten(pixel.0[3], bit_depth))
-                }),
-                ravif::PixelRange::Full,
-                ravif::MatrixCoefficients::BT709,
-            )
-            .map_err(|error| anyhow!("failed to encode 10-bit AVIF: {error}"))?
-            .avif_file
+        if loaded.has_alpha {
+            let rgba = loaded.image.to_rgba16();
+            let width = rgba.width() as usize;
+            let height = rgba.height() as usize;
+            let planes = rgba.pixels().map(|pixel| {
+                rgb16_to_10_bit_ycbcr(
+                    [
+                        scale_to_ten(pixel.0[0], bit_depth),
+                        scale_to_ten(pixel.0[1], bit_depth),
+                        scale_to_ten(pixel.0[2], bit_depth),
+                    ],
+                    BT709,
+                )
+            });
+            let alpha = rgba
+                .pixels()
+                .map(|pixel| scale_to_ten(pixel.0[3], bit_depth));
+
+            encoder
+                .encode_raw_planes_10_bit(
+                    width,
+                    height,
+                    planes,
+                    Some(alpha),
+                    ravif::PixelRange::Full,
+                    ravif::MatrixCoefficients::BT709,
+                )
+                .map_err(|error| anyhow!("failed to encode 10-bit AVIF: {error}"))?
+                .avif_file
+        } else {
+            let rgb = loaded.image.to_rgb16();
+            let width = rgb.width() as usize;
+            let height = rgb.height() as usize;
+            let planes = rgb.pixels().map(|pixel| {
+                rgb16_to_10_bit_ycbcr(
+                    [
+                        scale_to_ten(pixel.0[0], bit_depth),
+                        scale_to_ten(pixel.0[1], bit_depth),
+                        scale_to_ten(pixel.0[2], bit_depth),
+                    ],
+                    BT709,
+                )
+            });
+
+            encoder
+                .encode_raw_planes_10_bit(
+                    width,
+                    height,
+                    planes,
+                    None::<std::iter::Empty<u16>>,
+                    ravif::PixelRange::Full,
+                    ravif::MatrixCoefficients::BT709,
+                )
+                .map_err(|error| anyhow!("failed to encode 10-bit AVIF: {error}"))?
+                .avif_file
+        }
     } else {
         let encoder = RavifEncoder::new()
             .with_quality(f32::from(avif_quality))
@@ -1180,15 +1248,27 @@ fn save_original_avif(
             .with_bit_depth(AvifBitDepth::Ten)
             .with_internal_color_model(AvifColorModel::RGB)
             .with_num_threads(Some(avif_threads));
-        let rgba = loaded.image.to_rgba8();
-        encoder
-            .encode_rgba(Img::new(
-                rgba.as_raw().as_rgba(),
-                rgba.width() as usize,
-                rgba.height() as usize,
-            ))
-            .map_err(|error| anyhow!("failed to encode AVIF: {error}"))?
-            .avif_file
+        if loaded.has_alpha {
+            let rgba = loaded.image.to_rgba8();
+            encoder
+                .encode_rgba(Img::new(
+                    rgba.as_raw().as_rgba(),
+                    rgba.width() as usize,
+                    rgba.height() as usize,
+                ))
+                .map_err(|error| anyhow!("failed to encode AVIF: {error}"))?
+                .avif_file
+        } else {
+            let rgb = loaded.image.to_rgb8();
+            encoder
+                .encode_rgb(Img::new(
+                    rgb.as_raw().as_rgb(),
+                    rgb.width() as usize,
+                    rgb.height() as usize,
+                ))
+                .map_err(|error| anyhow!("failed to encode AVIF: {error}"))?
+                .avif_file
+        }
     };
 
     write_bytes_atomic(path, &avif_file)?;
@@ -1219,7 +1299,7 @@ fn save_thumbnail(
             let rgba = image.to_rgba8();
             let encoder = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height());
             let compressed = encoder.encode((quality as f32).clamp(1.0, 100.0));
-            encoded = (&*compressed).to_vec();
+            encoded = compressed.to_vec();
         }
     }
 
@@ -1228,10 +1308,11 @@ fn save_thumbnail(
 }
 
 fn compute_blurhash(image: &DynamicImage) -> Result<String> {
+    let source = crop_blurhash_edges(image);
     let reduced = resize_to_fit(
-        image,
-        blurhash_target_width(image.width(), image.height()),
-        blurhash_target_height(image.width(), image.height()),
+        &source,
+        blurhash_target_width(source.width(), source.height()),
+        blurhash_target_height(source.width(), source.height()),
     )?;
     let softened = reduced.blur(BLURHASH_BLUR_SIGMA).to_rgba8();
     let width = softened.width();
@@ -1241,6 +1322,19 @@ fn compute_blurhash(image: &DynamicImage) -> Result<String> {
 
     encode(components_x, components_y, width, height, &pixels)
         .map_err(|error| anyhow!("failed to encode blurhash: {error}"))
+}
+
+fn crop_blurhash_edges(image: &DynamicImage) -> DynamicImage {
+    let width = image.width();
+    let height = image.height();
+    let crop_x =
+        ((width as f32 * BLURHASH_EDGE_CROP_RATIO).round() as u32).min(width.saturating_sub(1) / 2);
+    let crop_y = ((height as f32 * BLURHASH_EDGE_CROP_RATIO).round() as u32)
+        .min(height.saturating_sub(1) / 2);
+    let crop_width = width.saturating_sub(crop_x * 2).max(1);
+    let crop_height = height.saturating_sub(crop_y * 2).max(1);
+
+    image.crop_imm(crop_x, crop_y, crop_width, crop_height)
 }
 
 fn blurhash_target_width(width: u32, height: u32) -> u32 {
@@ -1265,22 +1359,21 @@ fn blurhash_components(width: u32, height: u32) -> (u32, u32) {
     let aspect_ratio = width as f32 / height.max(1) as f32;
 
     if aspect_ratio >= 1.35 {
-        (5, 4)
+        (4, 3)
     } else if aspect_ratio <= 0.74 {
-        (4, 5)
+        (3, 4)
     } else {
-        (4, 4)
+        (3, 3)
     }
 }
 
 fn build_preview_image(
     source_path: &Path,
-    loaded: &LoadedImage,
     target_width: u32,
+    source_orientation: u8,
 ) -> Result<DynamicImage> {
     if cfg!(target_os = "macos") {
-        let preview_width = loaded.image.width().min(target_width).max(1);
-        match build_preview_image_with_sips(source_path, preview_width) {
+        match build_preview_image_with_sips(source_path, target_width.max(1)) {
             Ok(image) => return Ok(image),
             Err(error) => warn!(
                 "failed to build preview with sips for {}: {error:#}; falling back to internal preview pipeline",
@@ -1289,44 +1382,57 @@ fn build_preview_image(
         }
     }
 
-    build_preview_image_fallback(loaded)
+    let source_bytes = fs::read(source_path)
+        .with_context(|| format!("failed to read preview source {}", source_path.display()))?;
+    let mut loaded = load_image_from_bytes(source_path, &source_bytes)
+        .with_context(|| format!("failed to decode preview source {}", source_path.display()))?;
+    apply_source_orientation(&mut loaded.image, source_orientation);
+    build_preview_image_fallback(&loaded)
 }
 
 fn should_align_preview_orientation(source_path: &Path) -> bool {
     !is_heif_family(source_path)
 }
 
+fn build_orientation_reference(reference_image: &DynamicImage) -> Result<OrientationReference> {
+    let (canvas_width, canvas_height) =
+        orientation_compare_dimensions(reference_image.width(), reference_image.height());
+    let probe = normalize_orientation_compare_image(reference_image, canvas_width, canvas_height)?
+        .to_rgb8();
+
+    Ok(OrientationReference {
+        canvas_width,
+        canvas_height,
+        probe,
+    })
+}
+
 fn align_preview_orientation(
     preview_image: DynamicImage,
-    reference_image: &DynamicImage,
+    reference: &OrientationReference,
 ) -> Result<DynamicImage> {
-    let transform = best_orientation_transform(&preview_image, reference_image)?;
+    let transform = best_orientation_transform(&preview_image, reference)?;
     Ok(apply_orientation_transform(preview_image, transform))
 }
 
 fn best_orientation_transform(
     preview_image: &DynamicImage,
-    reference_image: &DynamicImage,
+    reference: &OrientationReference,
 ) -> Result<OrientationTransform> {
     let preview_probe = resize_to_fit(
         preview_image,
         PREVIEW_ORIENTATION_COMPARE_SIZE,
         PREVIEW_ORIENTATION_COMPARE_SIZE,
     )?;
-    let (canvas_width, canvas_height) =
-        orientation_compare_dimensions(reference_image.width(), reference_image.height());
-    let reference_probe =
-        normalize_orientation_compare_image(reference_image, canvas_width, canvas_height)?
-            .to_rgb8();
     let mut best: Option<(u64, OrientationTransform)> = None;
 
     for transform in OrientationTransform::ALL {
         let candidate = apply_orientation_transform(preview_probe.clone(), transform);
         let score = orientation_similarity_score(
             &candidate,
-            &reference_probe,
-            canvas_width,
-            canvas_height,
+            &reference.probe,
+            reference.canvas_width,
+            reference.canvas_height,
         )?;
         let replace = match best {
             Some((best_score, _)) => score < best_score,
@@ -1397,6 +1503,12 @@ enum OrientationTransform {
     FlipHRotate270,
 }
 
+struct OrientationReference {
+    canvas_width: u32,
+    canvas_height: u32,
+    probe: image::RgbImage,
+}
+
 impl OrientationTransform {
     const ALL: [Self; 8] = [
         Self::Identity,
@@ -1428,12 +1540,35 @@ fn apply_orientation_transform(
 
 fn build_preview_image_fallback(loaded: &LoadedImage) -> Result<DynamicImage> {
     if loaded.bit_depth <= 8 {
-        return Ok(DynamicImage::ImageRgba8(loaded.image.to_rgba8()));
+        if loaded.has_alpha {
+            return Ok(DynamicImage::ImageRgba8(loaded.image.to_rgba8()));
+        }
+
+        return Ok(DynamicImage::ImageRgb8(loaded.image.to_rgb8()));
     }
 
     let source_bit_depth = loaded.bit_depth.clamp(9, 16);
-    let rgba16 = loaded.image.to_rgba16();
-    let pixels = rgba16
+    if loaded.has_alpha {
+        let rgba16 = loaded.image.to_rgba16();
+        let pixels = rgba16
+            .pixels()
+            .flat_map(|pixel| {
+                pixel
+                    .0
+                    .iter()
+                    .map(|component| preview_scale_to_eight(*component, source_bit_depth))
+            })
+            .collect::<Vec<_>>();
+
+        let buffer =
+            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(rgba16.width(), rgba16.height(), pixels)
+                .ok_or_else(|| anyhow!("failed to build preview RGBA image buffer"))?;
+
+        return Ok(DynamicImage::ImageRgba8(buffer));
+    }
+
+    let rgb16 = loaded.image.to_rgb16();
+    let pixels = rgb16
         .pixels()
         .flat_map(|pixel| {
             pixel
@@ -1442,12 +1577,10 @@ fn build_preview_image_fallback(loaded: &LoadedImage) -> Result<DynamicImage> {
                 .map(|component| preview_scale_to_eight(*component, source_bit_depth))
         })
         .collect::<Vec<_>>();
+    let buffer = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(rgb16.width(), rgb16.height(), pixels)
+        .ok_or_else(|| anyhow!("failed to build preview RGB image buffer"))?;
 
-    let buffer =
-        ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(rgba16.width(), rgba16.height(), pixels)
-            .ok_or_else(|| anyhow!("failed to build preview RGBA image buffer"))?;
-
-    Ok(DynamicImage::ImageRgba8(buffer))
+    Ok(DynamicImage::ImageRgb8(buffer))
 }
 
 fn build_preview_image_with_sips(source_path: &Path, target_width: u32) -> Result<DynamicImage> {
@@ -1709,27 +1842,25 @@ fn load_previous_state(path: &Path) -> Result<StateFile> {
 
 fn checkpoint_outputs(
     config: &Config,
-    photos: &[PhotoEntry],
+    photos: &BTreeMap<String, PhotoEntry>,
     files: &BTreeMap<String, StateEntry>,
 ) -> Result<()> {
-    let mut photos = photos.to_vec();
-    photos.sort_by(|left, right| left.original.url.cmp(&right.original.url));
     let now = now_rfc3339()?;
 
     write_json(
         &config.manifest_path(),
-        &ManifestFile {
+        &ManifestFileRef {
             version: 1,
             updated_at: now.clone(),
-            photos,
+            photos: photos.values().collect(),
         },
     )?;
     write_json(
         &config.state_path(),
-        &StateFile {
+        &StateFileRef {
             version: 1,
             updated_at: now,
-            files: files.clone(),
+            files,
         },
     )?;
 
@@ -1737,65 +1868,56 @@ fn checkpoint_outputs(
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let tmp_path = temporary_output_path(path);
+    let mut tmp_file = temporary_output_file(path)?;
     {
-        let file = File::create(&tmp_path)
-            .with_context(|| format!("failed to create {}", tmp_path.display()))?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, value)
-            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        let mut writer = BufWriter::new(tmp_file.as_file_mut());
+        serde_json::to_writer(&mut writer, value)
+            .with_context(|| format!("failed to write temporary JSON for {}", path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("failed to flush temporary JSON for {}", path.display()))?;
     }
-    replace_atomic(&tmp_path, path)?;
+    persist_temporary_file(tmp_file, path)?;
     Ok(())
 }
 
 fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp_path = temporary_output_path(path);
+    let mut tmp_file = temporary_output_file(path)?;
     {
-        let file = File::create(&tmp_path)
-            .with_context(|| format!("failed to create {}", tmp_path.display()))?;
-        let mut writer = BufWriter::new(file);
+        let mut writer = BufWriter::new(tmp_file.as_file_mut());
         writer
             .write_all(bytes)
-            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+            .with_context(|| format!("failed to write temporary file for {}", path.display()))?;
         writer
             .flush()
-            .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
+            .with_context(|| format!("failed to flush temporary file for {}", path.display()))?;
     }
-    replace_atomic(&tmp_path, path)?;
+    persist_temporary_file(tmp_file, path)?;
     Ok(())
 }
 
-fn replace_atomic(tmp_path: &Path, path: &Path) -> Result<()> {
-    fs::rename(tmp_path, path).with_context(|| {
-        format!(
-            "failed to replace {} with {}",
-            path.display(),
-            tmp_path.display()
-        )
-    })?;
-    Ok(())
+fn temporary_output_file(path: &Path) -> Result<tempfile::NamedTempFile> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    tempfile::Builder::new()
+        .prefix(".aether-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create temporary file for {}", path.display()))
 }
 
-fn temporary_output_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|name| {
-            let mut name = name.to_os_string();
-            name.push(".tmp");
-            name
-        })
-        .unwrap_or_else(|| OsString::from("aether.tmp"));
-
-    path.with_file_name(file_name)
+fn persist_temporary_file(tmp_file: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    tmp_file
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| anyhow!("failed to replace {}: {}", path.display(), error.error))
 }
 
-fn metadata_mtime_ms(metadata: &fs::Metadata) -> Result<u128> {
+fn metadata_mtime_ms(metadata: &fs::Metadata) -> Result<u64> {
     let modified = metadata.modified()?;
     let duration = modified
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| anyhow!("invalid file mtime: {error}"))?;
-    Ok(duration.as_millis())
+    u64::try_from(duration.as_millis()).map_err(|_| anyhow!("file mtime is too large"))
 }
 
 fn now_rfc3339() -> Result<String> {
@@ -1817,8 +1939,8 @@ fn scale_to_ten(value: u16, source_bit_depth: u8) -> u16 {
 
 fn preview_scale_to_eight(value: u16, source_bit_depth: u8) -> u8 {
     let source_bit_depth = source_bit_depth.clamp(1, 16);
-    let source_max = ((1u32 << source_bit_depth) - 1).max(1) as f32;
-    let normalized = (f32::from(value.min(source_max as u16)) / source_max).clamp(0.0, 1.0);
+    let source_max = ((1u32 << source_bit_depth) - 1).max(1);
+    let normalized = (u32::from(value).min(source_max) as f32 / source_max as f32).clamp(0.0, 1.0);
     let gamma_mapped = normalized.powf(1.0 / 2.2);
     (gamma_mapped * 255.0).round().clamp(0.0, 255.0) as u8
 }
@@ -1895,13 +2017,23 @@ struct SourceItem {
     relative_path: PathBuf,
     source_key: String,
     size: u64,
-    mtime_ms: u128,
+    mtime_ms: u64,
 }
 
 struct LoadedImage {
     image: DynamicImage,
     bit_depth: u8,
     has_alpha: bool,
+}
+
+struct ProcessContext<'a> {
+    config: &'a Config,
+    root_dir: &'a Path,
+    originals_dir: &'a Path,
+    thumbnails_dir: &'a Path,
+    avif_threads: usize,
+    avif_limiter: &'a Arc<EncodeLimiter>,
+    status: &'a Arc<BuildStatus>,
 }
 
 struct ProcessedPhoto {
@@ -1911,7 +2043,7 @@ struct ProcessedPhoto {
 }
 
 enum BuildOutcome {
-    Success(ProcessedPhoto),
+    Success(Box<ProcessedPhoto>),
     Failure { source_key: String, error: String },
 }
 
@@ -1932,6 +2064,14 @@ struct ManifestFile {
     #[serde(rename = "updatedAt")]
     updated_at: String,
     photos: Vec<PhotoEntry>,
+}
+
+#[derive(Serialize)]
+struct ManifestFileRef<'a> {
+    version: u8,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+    photos: Vec<&'a PhotoEntry>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1970,15 +2110,19 @@ struct StateFile {
     files: BTreeMap<String, StateEntry>,
 }
 
+#[derive(Serialize)]
+struct StateFileRef<'a> {
+    version: u8,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+    files: &'a BTreeMap<String, StateEntry>,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct StateEntry {
-    #[serde(default, rename = "pipelineVersion")]
-    pipeline_version: u16,
-    #[serde(default, rename = "configFingerprint")]
-    config_fingerprint: String,
     size: u64,
     #[serde(rename = "mtimeMs")]
-    mtime_ms: u128,
+    mtime_ms: u64,
     #[serde(default)]
     original: String,
     thumbnail: String,
